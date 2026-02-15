@@ -1,0 +1,32 @@
+build/
+__pycache__/
+*.bak*
+*.pyc
+
+# Generated outputs
+*.ply
+estimated_trajectory*.txt
+dense_map_estimated.ply
+
+# Models (too large for git)
+models/*.onnx
+models/*.onnx.data
+models/*.pth
+models/*.bin
+models/export_*.py
+
+# External large deps
+external/PoissonRecon/
+
+# LaTeX temp files
+*.aux
+*.log
+*.out
+*.synctex.gz
+missfont.log
+
+# Dev scripts
+ate_analysis.py
+
+# Report
+report.*
