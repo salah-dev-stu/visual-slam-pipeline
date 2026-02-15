@@ -1292,7 +1292,7 @@ void slam_processing_thread(const std::vector<ImageInfo>& images,
     if (!gt_all.empty() && !est_poses.empty()) {
         auto align = compute_ate(est_poses, gt_all);
         if (align.ate_rmse >= 0) {
-            // std::cout << "ATE RMSE: " << align.ate_rmse << " m" << std::endl;
+            std::cout << "ATE RMSE: " << align.ate_rmse << " m" << std::endl;
         }
     }
 

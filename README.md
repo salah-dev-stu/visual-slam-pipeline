@@ -2,7 +2,7 @@
 
 A monocular visual SLAM system built from scratch in C++. Runs on TUM RGB-D sequences and produces trajectory estimates + dense 3D reconstructions in real time.
 
-Tested on the `freiburg2_pioneer_slam3` sequence (2544 frames, indoor ground robot). Achieves **0.109m ATE RMSE** which is competitive with established systems on this difficult sequence.
+Tested on the `freiburg2_pioneer_slam3` sequence (2544 frames, indoor ground robot). Achieves **0.132m ATE RMSE** which is competitive with established systems on this difficult sequence.
 
 ![Dense reconstruction with trajectory](screenshot_full.png)
 
