@@ -75,5 +75,4 @@ src/
   LoopCloser.cpp    - loop closure detection via feature matching
   Viewer.cpp        - Pangolin visualization
 include/            - corresponding headers
-evaluate_map.py     - point cloud evaluation against ground truth
 ```
