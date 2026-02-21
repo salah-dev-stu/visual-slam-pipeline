@@ -20,6 +20,9 @@
 
 Optimizer::Optimizer() {}
 
+/// Projects a 3D world point into the image plane using the given camera pose
+/// (R_world, t_world in world-to-camera convention) and intrinsics K.
+/// Returns (-1,-1) if the point is behind the camera.
 cv::Point2d Optimizer::project_point(const cv::Point3d& pw,
                                       const cv::Mat& R_world,
                                       const cv::Mat& t_world,
@@ -44,6 +47,10 @@ cv::Point2d Optimizer::project_point(const cv::Point3d& pw,
     return cv::Point2d(u, v);
 }
 
+/// Gauss-Newton pose refinement with Levenberg-Marquardt damping.
+/// Minimizes reprojection error of 3D-2D correspondences by iteratively
+/// updating the frame's rotation (Rodrigues) and translation.
+/// Returns (error_before, error_after) in pixels (RMS).
 std::pair<double, double> Optimizer::optimize_pose(
     std::shared_ptr<Frame> frame,
     const std::vector<cv::Point3d>& points_3d,
@@ -172,6 +179,11 @@ std::pair<double, double> Optimizer::optimize_pose(
     return {error_before, error_after};
 }
 
+/// Sliding-window local bundle adjustment using the Schur complement trick.
+/// Jointly optimizes the last `window_size` keyframe poses and all co-visible
+/// map points. Uses Huber robust cost (5px threshold) and LM damping.
+/// First keyframe in the window is fixed to prevent gauge drift.
+/// Returns (error_before, error_after) in pixels (RMS).
 std::pair<double, double> Optimizer::local_bundle_adjustment(
     Map& map, const cv::Mat& K, int window_size) {
 
@@ -586,7 +598,9 @@ std::pair<double, double> Optimizer::local_bundle_adjustment(
     return {error_before, error_after};
 }
 
-// Height prior edge for PGO
+/// Custom g2o unary edge that constrains a vertex's height (projection onto
+/// the gravity direction) to a measured value. Used in PGO to enforce the
+/// planar motion assumption from accelerometer-derived gravity.
 class EdgeHeightPrior : public g2o::BaseUnaryEdge<1, double, g2o::VertexSE3> {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -606,6 +620,7 @@ private:
     Eigen::Vector3d gravity_dir_;
 };
 
+/// Converts an OpenCV (R, t) pose to an Eigen Isometry3d for g2o vertices.
 static Eigen::Isometry3d cvToIsometry(const cv::Mat& R, const cv::Mat& t) {
     Eigen::Matrix3d R_eigen;
     for (int i = 0; i < 3; i++)
@@ -618,6 +633,7 @@ static Eigen::Isometry3d cvToIsometry(const cv::Mat& R, const cv::Mat& t) {
     return iso;
 }
 
+/// Converts an Eigen Isometry3d back to OpenCV (R, t) matrices.
 static void isometryToCv(const Eigen::Isometry3d& iso, cv::Mat& R, cv::Mat& t) {
     R = cv::Mat::eye(3, 3, CV_64F);
     t = cv::Mat::zeros(3, 1, CV_64F);
@@ -628,6 +644,13 @@ static void isometryToCv(const Eigen::Isometry3d& iso, cv::Mat& R, cv::Mat& t) {
     }
 }
 
+/// Post-hoc pose graph optimization using g2o's Levenberg-Marquardt solver.
+/// Builds a graph of SE3 vertices (one per keyframe) with:
+///   - Odometry edges between consecutive keyframes
+///   - Loop closure edges from detected loops
+///   - Optional height prior edges (gravity-aligned planar constraint)
+/// After optimization, non-keyframe poses and map points are corrected by
+/// interpolating the keyframe corrections. Returns the number of loop edges added.
 int Optimizer::pose_graph_optimize(
     Map& map,
     const std::vector<LoopConstraint>& loop_constraints,
@@ -839,6 +862,9 @@ int Optimizer::pose_graph_optimize(
     return loop_edges_added;
 }
 
+/// Distributes a loop closure correction linearly across frames in the range
+/// [loop_start_id, loop_end_id]. Adjusts both frame translations and map
+/// point positions proportionally to their temporal distance from the start.
 void Optimizer::correct_loop(Map& map, int loop_start_id, int loop_end_id,
                               const cv::Mat& R_correction, const cv::Mat& t_correction) {
     std::lock_guard<std::mutex> lock(map.mutex());

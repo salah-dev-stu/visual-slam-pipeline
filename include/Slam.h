@@ -95,6 +95,21 @@ private:
 
     int track_local_map(std::shared_ptr<Frame> frame);
 
+    // Invalidates map points with large reprojection errors for a given frame
+    void cull_map_points(std::shared_ptr<Frame> frame);
+
+    // Attempts PnP-based recovery when feature matching fails.
+    // Returns: 1 = recovered, 0 = not needed, -1 = failed
+    int try_pnp_recovery(std::shared_ptr<Frame> frame);
+
+    // Handles stationary frame detection and processing.
+    // Returns true if frame was stationary (caller should return true from process_frame)
+    bool process_stationary_frame(std::shared_ptr<Frame> frame,
+                                   const std::vector<cv::DMatch>& good_matches);
+
+    // Common keyframe initialization: triangulation, depth points, optional BA, culling
+    void setup_new_keyframe(std::shared_ptr<Frame> frame);
+
     bool estimate_motion_3d3d(const std::vector<cv::Point2f>& pts1,
                                const std::vector<cv::Point2f>& pts2,
                                std::shared_ptr<Frame> ref_frame,

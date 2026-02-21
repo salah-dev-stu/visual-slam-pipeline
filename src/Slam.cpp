@@ -8,6 +8,7 @@
 #include <random>
 
 
+/// Initializes SLAM state: camera intrinsics, identity pose, and feature matchers.
 Slam::Slam()
     : frame_count_(0), keyframe_count_(0),
       last_match_count_(0), last_inlier_count_(0),
@@ -23,26 +24,31 @@ Slam::Slam()
     matcher_hamming_ = cv::BFMatcher::create(cv::NORM_HAMMING, false);
 }
 
+/// Loads the SuperPoint and MiDaS ONNX models from the given directory.
 bool Slam::init(const std::string& model_dir) {
     feature_extractor_.init(model_dir + "/superpoint_v1.onnx");
     depth_estimator_.init(model_dir + "/midas_v21_small_256.onnx");
     return true;
 }
 
+/// Sets the initial camera pose in world coordinates.
 void Slam::set_initial_pose(const cv::Mat& R, const cv::Mat& t) {
     R.copyTo(R_world_);
     t.copyTo(t_world_);
 }
 
+/// Seeds the motion model with a known translation direction.
 void Slam::seed_motion(const cv::Mat& direction) {
     last_translation_ = direction.clone();
 }
 
+/// Returns the number of valid 3D map points.
 int Slam::map_point_count() const {
     auto pts = map_.get_all_point_positions();
     return (int)pts.size();
 }
 
+/// Returns loop closure edges as pairs of 3D positions for visualization.
 std::vector<std::pair<cv::Point3d, cv::Point3d>> Slam::get_loop_edges() const {
     std::vector<std::pair<cv::Point3d, cv::Point3d>> edges;
     for (const auto& e : loop_edges_) {
@@ -59,6 +65,11 @@ std::vector<std::pair<cv::Point3d, cv::Point3d>> Slam::get_loop_edges() const {
     return edges;
 }
 
+/// Estimates the translation scale using depth from both reference and current frames.
+/// Back-projects matched 2D points to 3D using Kinect depth, then solves for the scale
+/// factor s in: P2 = R_rel * P1 + s * t_rel. Uses IQR-based outlier rejection
+/// and returns the median of filtered scale estimates.
+/// Falls back to single-depth estimation if the current frame lacks depth.
 double Slam::estimate_scale_from_depth(const std::vector<cv::Point2f>& pts1,
                                         const std::vector<cv::Point2f>& pts2,
                                         const cv::Mat& R_rel, const cv::Mat& t_rel,
@@ -108,8 +119,7 @@ double Slam::estimate_scale_from_depth(const std::vector<cv::Point2f>& pts1,
             (pts2[i].y - cy) * d2 / fy,
             (double)d2);
 
-        // P2 = R_rel * P1 + s * t_rel
-        // s = (P2 - R_rel * P1) · t_rel  (since ||t_rel|| = 1)
+        // s = (P2 - R_rel * P1) dot t_rel  (since ||t_rel|| = 1)
         cv::Mat diff = P2 - R_rel * P1;
         double s = diff.at<double>(0) * tx + diff.at<double>(1) * ty + diff.at<double>(2) * tz;
 
@@ -122,6 +132,7 @@ double Slam::estimate_scale_from_depth(const std::vector<cv::Point2f>& pts1,
         return estimate_scale_single_depth(pts1, pts2, R_rel, t_rel, depth1);
     }
 
+    // IQR-based outlier rejection
     std::sort(scales.begin(), scales.end());
     int q1_idx = scales.size() / 4;
     int q3_idx = 3 * scales.size() / 4;
@@ -145,6 +156,9 @@ double Slam::estimate_scale_from_depth(const std::vector<cv::Point2f>& pts1,
     return result;
 }
 
+/// Estimates scale using only the reference frame's depth map (single-view fallback).
+/// For each matched point, back-projects from ref depth and solves for scale using
+/// the reprojection constraint in x and y directions independently.
 double Slam::estimate_scale_single_depth(const std::vector<cv::Point2f>& pts1,
                                           const std::vector<cv::Point2f>& pts2,
                                           const cv::Mat& R_rel, const cv::Mat& t_rel,
@@ -192,6 +206,11 @@ double Slam::estimate_scale_single_depth(const std::vector<cv::Point2f>& pts1,
     return scales[scales.size() / 2];
 }
 
+/// Estimates relative pose via 3D-3D rigid body alignment using RANSAC + SVD.
+/// Back-projects matched 2D points from both frames using Kinect depth to get 3D-3D
+/// correspondences, then finds the best rigid transform (R, t) via RANSAC with
+/// 3-point SVD-based minimal solver. Refines with all inliers after RANSAC.
+/// Preferred over Essential matrix when depth is available (metric, no scale ambiguity).
 bool Slam::estimate_motion_3d3d(const std::vector<cv::Point2f>& pts1,
                                  const std::vector<cv::Point2f>& pts2,
                                  std::shared_ptr<Frame> ref_frame,
@@ -209,6 +228,7 @@ bool Slam::estimate_motion_3d3d(const std::vector<cv::Point2f>& pts1,
     double fx = K_.at<double>(0, 0), fy = K_.at<double>(1, 1);
     double cx = K_.at<double>(0, 2), cy = K_.at<double>(1, 2);
 
+    // Back-project matched 2D points to 3D using depth
     std::vector<cv::Mat> pts3d_1, pts3d_2;
     pts3d_1.reserve(pts1.size());
     pts3d_2.reserve(pts1.size());
@@ -246,7 +266,7 @@ bool Slam::estimate_motion_3d3d(const std::vector<cv::Point2f>& pts1,
         return false;
     }
 
-    // RANSAC + SVD rigid transform
+    // RANSAC with SVD-based rigid transform (3-point minimal solver)
     const int MAX_ITER = 200;
     const double INLIER_THRESH = 0.05;  // 5cm
 
@@ -256,6 +276,7 @@ bool Slam::estimate_motion_3d3d(const std::vector<cv::Point2f>& pts1,
     std::mt19937 rng(42 + frame_count_);
 
     for (int iter = 0; iter < MAX_ITER; iter++) {
+        // Sample 3 random correspondences
         int i0 = rng() % N;
         int i1, i2;
         do { i1 = rng() % N; } while (i1 == i0);
@@ -300,7 +321,7 @@ bool Slam::estimate_motion_3d3d(const std::vector<cv::Point2f>& pts1,
         return false;
     }
 
-    // Recompute with all inliers
+    // Refine with all RANSAC inliers
     std::vector<int> inlier_idx;
     inlier_idx.reserve(best_inliers);
     cv::Mat c1 = cv::Mat::zeros(3, 1, CV_64F);
@@ -336,6 +357,7 @@ bool Slam::estimate_motion_3d3d(const std::vector<cv::Point2f>& pts1,
 
     t_out = c2 - R_out * c1;
 
+    // Sanity checks: reject excessive or negligible translation
     double t_norm = cv::norm(t_out);
     if (t_norm > 0.2) {
         return false;
@@ -352,6 +374,9 @@ bool Slam::estimate_motion_3d3d(const std::vector<cv::Point2f>& pts1,
     return true;
 }
 
+/// Tracks existing map points by projecting them into the current frame and matching
+/// descriptors within a spatial search window. Uses a grid-based spatial index for
+/// efficient 2D lookup. Updates frame's map_point_indices with matched point IDs.
 int Slam::track_local_map(std::shared_ptr<Frame> frame) {
     auto& indices = frame->map_point_indices();
     const auto& kps = frame->keypoints();
@@ -361,7 +386,7 @@ int Slam::track_local_map(std::shared_ptr<Frame> frame) {
     int nkp = (int)kps.size();
     std::vector<double> best_desc_dist(nkp, 1e9);
 
-    // Build grid index for keypoints (30px cells)
+    // Build grid index for keypoints (30px cells) for efficient spatial search
     const int CELL_SIZE = 30;
     const int GRID_W = (Config::IMAGE_WIDTH + CELL_SIZE - 1) / CELL_SIZE;
     const int GRID_H = (Config::IMAGE_HEIGHT + CELL_SIZE - 1) / CELL_SIZE;
@@ -392,6 +417,7 @@ int Slam::track_local_map(std::shared_ptr<Frame> frame) {
         if (!mps[mp_id].is_valid()) continue;
         if (mps[mp_id].descriptor().empty()) continue;
 
+        // Project map point to image coordinates
         const cv::Point3d& pos = mps[mp_id].position();
         double px = R_cam.at<double>(0,0)*pos.x + R_cam.at<double>(0,1)*pos.y + R_cam.at<double>(0,2)*pos.z + t_cam.at<double>(0);
         double py = R_cam.at<double>(1,0)*pos.x + R_cam.at<double>(1,1)*pos.y + R_cam.at<double>(1,2)*pos.z + t_cam.at<double>(1);
@@ -404,6 +430,7 @@ int Slam::track_local_map(std::shared_ptr<Frame> frame) {
 
         if (u < 0 || u >= Config::IMAGE_WIDTH || v < 0 || v >= Config::IMAGE_HEIGHT) continue;
 
+        // Search in nearby grid cells for descriptor match
         int gx0 = std::max(0, (int)((u - SEARCH_RADIUS) / CELL_SIZE));
         int gy0 = std::max(0, (int)((v - SEARCH_RADIUS) / CELL_SIZE));
         int gx1 = std::min(GRID_W - 1, (int)((u + SEARCH_RADIUS) / CELL_SIZE));
@@ -441,6 +468,260 @@ int Slam::track_local_map(std::shared_ptr<Frame> frame) {
     return tracked;
 }
 
+/// Invalidates map points that reproject with large errors (>20px) in the given frame.
+/// Used after keyframe creation to remove grossly inconsistent points.
+void Slam::cull_map_points(std::shared_ptr<Frame> frame) {
+    std::lock_guard<std::mutex> lock(map_.mutex());
+    auto& mps = map_.map_points();
+    const auto& indices = frame->map_point_indices();
+    cv::Mat R_cur = frame->get_rotation();
+    cv::Mat t_cur = frame->get_translation();
+    cv::Mat R_cam = R_cur.t();
+    cv::Mat t_cam = -R_cam * t_cur;
+    double fx = K_.at<double>(0,0), fy = K_.at<double>(1,1);
+    double cx = K_.at<double>(0,2), cy = K_.at<double>(1,2);
+    for (int i = 0; i < (int)indices.size(); i++) {
+        int mp_id = indices[i];
+        if (mp_id >= 0 && mp_id < (int)mps.size() && mps[mp_id].is_valid()) {
+            cv::Point3d pw = mps[mp_id].position();
+            cv::Mat Pw = (cv::Mat_<double>(3,1) << pw.x, pw.y, pw.z);
+            cv::Mat pc = R_cam * Pw + t_cam;
+            double z = pc.at<double>(2);
+            if (z < 0.1) { mps[mp_id].set_valid(false); continue; }
+            double u = fx * pc.at<double>(0) / z + cx;
+            double v = fy * pc.at<double>(1) / z + cy;
+            double dx = u - frame->keypoints()[i].pt.x;
+            double dy = v - frame->keypoints()[i].pt.y;
+            if (dx*dx + dy*dy > 400.0) {
+                mps[mp_id].set_valid(false);
+            }
+        }
+    }
+}
+
+/// Attempts PnP-based tracking recovery when feature matching with the reference
+/// frame fails. Matches current frame descriptors against all valid map points
+/// using FLANN, then solves PnP to recover the camera pose.
+/// Returns: 1 = recovered, 0 = not needed (enough matches), -1 = failed
+int Slam::try_pnp_recovery(std::shared_ptr<Frame> frame) {
+    if (pnp_recovery_cooldown_ > 0) pnp_recovery_cooldown_--;
+
+    if (last_match_count_ >= Config::MIN_MATCHES) return 0;
+
+    // In cooldown period after a recent recovery — skip
+    if (pnp_recovery_cooldown_ > 0) {
+        last_frame_ = frame;
+        return -1;
+    }
+
+    // Collect all valid map points and their descriptors for matching
+    std::vector<cv::Point3f> all_obj_pts;
+    cv::Mat all_mp_descs;
+    {
+        std::lock_guard<std::mutex> lock(map_.mutex());
+        const auto& mps = map_.map_points();
+        for (int mi = 0; mi < (int)mps.size(); mi++) {
+            if (!mps[mi].is_valid() || mps[mi].descriptor().empty()) continue;
+            cv::Point3d p = mps[mi].position();
+            all_obj_pts.emplace_back((float)p.x, (float)p.y, (float)p.z);
+            all_mp_descs.push_back(mps[mi].descriptor());
+        }
+    }
+
+    if (all_mp_descs.rows >= 50 && !frame->descriptors().empty()) {
+        std::vector<cv::Point3f> obj_pts;
+        std::vector<cv::Point2f> img_pts;
+
+        // Match current frame features against global map descriptors
+        auto flann = cv::FlannBasedMatcher::create();
+        std::vector<std::vector<cv::DMatch>> knn;
+        flann->knnMatch(frame->descriptors(), all_mp_descs, knn, 2);
+
+        for (const auto& m : knn) {
+            if (m.size() >= 2 && m[0].distance < 0.7f * m[1].distance) {
+                obj_pts.push_back(all_obj_pts[m[0].trainIdx]);
+                img_pts.push_back(frame->keypoints()[m[0].queryIdx].pt);
+            }
+        }
+
+        if ((int)obj_pts.size() >= 20) {
+            cv::Mat rvec, tvec, inliers;
+            bool ok = cv::solvePnPRansac(obj_pts, img_pts, K_, cv::Mat(),
+                                          rvec, tvec, false,
+                                          300, (float)Config::PNP_RANSAC_THRESHOLD,
+                                          0.99, inliers);
+
+            if (ok && inliers.rows >= 15) {
+                cv::Mat R_cam;
+                cv::Rodrigues(rvec, R_cam);
+                cv::Mat R_pnp = R_cam.t();
+                cv::Mat t_pnp = -R_cam.t() * tvec;
+
+                double jump = cv::norm(t_pnp - t_world_);
+
+                if (jump < 1.5) {
+                    // Blend recovered pose with current estimate
+                    double blend = (jump < 0.1) ? 0.8 : 0.3;
+                    R_world_ = R_pnp.clone();
+                    t_world_ = (1.0 - blend) * t_world_ + blend * t_pnp;
+                    frame->set_pose(R_world_, t_world_);
+                    map_.add_frame(frame);
+
+                    frame->set_keyframe(true);
+                    keyframe_count_++;
+                    create_points_from_depth(frame);
+                    last_keyframe_ = frame;
+                    last_frame_ = frame;
+                    frame_count_++;
+                    // Reset EKF state to recovered position
+                    if (ekf_initialized_) {
+                        for (int i = 0; i < 3; i++)
+                            ekf_x_.at<double>(i) = t_world_.at<double>(i);
+                        for (int i = 3; i < 6; i++)
+                            ekf_x_.at<double>(i) = 0;
+                    }
+                    last_frame_time_ = frame->timestamp();
+                    pnp_recovery_cooldown_ = 10;
+                    return 1;  // Recovery succeeded
+                }
+            }
+        }
+    }
+
+    last_frame_ = frame;
+    return -1;  // Recovery failed
+}
+
+/// Handles processing when the camera is detected as stationary (via accelerometer).
+/// Maintains current position, refines orientation via PnP with tracked map points,
+/// and resets EKF velocity to zero. Returns true if the frame was stationary.
+bool Slam::process_stationary_frame(std::shared_ptr<Frame> frame,
+                                     const std::vector<cv::DMatch>& good_matches) {
+    bool frame_stationary = is_frame_stationary(frame->timestamp());
+    if (!frame_stationary || frame_count_ <= 5) return false;
+
+    frame->set_pose(R_world_, t_world_);
+    map_.add_frame(frame);
+
+    int tracked = track_local_map(frame);
+
+    // Refine rotation using tracked map points via PnP
+    if (tracked >= 10) {
+        std::vector<cv::Point3f> obj_pts;
+        std::vector<cv::Point2f> img_pts;
+        {
+            std::lock_guard<std::mutex> lock(map_.mutex());
+            const auto& mps = map_.map_points();
+            const auto& indices = frame->map_point_indices();
+            for (int i = 0; i < (int)indices.size(); i++) {
+                int mp_id = indices[i];
+                if (mp_id >= 0 && mp_id < (int)mps.size() && mps[mp_id].is_valid()) {
+                    cv::Point3d p = mps[mp_id].position();
+                    obj_pts.emplace_back((float)p.x, (float)p.y, (float)p.z);
+                    img_pts.push_back(frame->keypoints()[i].pt);
+                }
+            }
+        }
+        if ((int)obj_pts.size() >= 10) {
+            cv::Mat rvec, tvec, inliers;
+            bool ok = cv::solvePnPRansac(obj_pts, img_pts, K_, cv::Mat(),
+                                          rvec, tvec, false, 100,
+                                          (float)Config::PNP_RANSAC_THRESHOLD,
+                                          0.99, inliers);
+            if (ok && inliers.rows >= 10) {
+                cv::Mat R_cam;
+                cv::Rodrigues(rvec, R_cam);
+                cv::Mat R_pnp = R_cam.t();
+                R_world_ = R_pnp;
+                frame->set_pose(R_world_, t_world_);
+            }
+        }
+    }
+
+    // Check if rotation has drifted enough to warrant a new keyframe
+    if (last_keyframe_) {
+        cv::Mat R_kf = last_keyframe_->get_rotation();
+        cv::Mat R_diff = R_world_.t() * R_kf;
+        cv::Mat rvec_diff;
+        cv::Rodrigues(R_diff, rvec_diff);
+        double angle = cv::norm(rvec_diff);
+        if (angle > 0.25) {
+            frame->set_keyframe(true);
+            keyframe_count_++;
+            create_points_from_depth(frame);
+            last_keyframe_ = frame;
+        }
+    }
+
+    last_frame_ = frame;
+    last_match_count_ = (int)good_matches.size();
+    last_inlier_count_ = last_match_count_;
+    frame_count_++;
+    was_stationary_ = true;
+
+    // Zero out velocity during stationary periods
+    last_translation_ = cv::Mat::zeros(3, 1, CV_64F);
+
+    if (ekf_initialized_) {
+        ekf_x_.at<double>(3) = 0;
+        ekf_x_.at<double>(4) = 0;
+        ekf_x_.at<double>(5) = 0;
+        ekf_x_.at<double>(0) = t_world_.at<double>(0);
+        ekf_x_.at<double>(1) = t_world_.at<double>(1);
+        ekf_x_.at<double>(2) = t_world_.at<double>(2);
+        for (int i = 3; i < 6; i++) {
+            for (int j = 0; j < 6; j++) {
+                ekf_P_.at<double>(i, j) = 0;
+                ekf_P_.at<double>(j, i) = 0;
+            }
+            ekf_P_.at<double>(i, i) = 1e-4;
+        }
+    }
+    last_frame_time_ = frame->timestamp();
+
+    return true;
+}
+
+/// Common keyframe initialization: triangulates new map points with the previous
+/// keyframe, creates depth-based map points, runs optional local BA, and culls
+/// map points with large reprojection errors.
+void Slam::setup_new_keyframe(std::shared_ptr<Frame> frame) {
+    if (last_keyframe_) {
+        auto kf_matches = match_features(last_keyframe_->descriptors(), frame->descriptors());
+        if ((int)kf_matches.size() >= Config::MIN_MATCHES) {
+            triangulate_points(last_keyframe_, frame, kf_matches);
+        }
+    }
+
+    create_points_from_depth(frame);
+
+    if (Config::ENABLE_LOCAL_BA) {
+        cv::Mat t_before = frame->get_translation().clone();
+        auto [ba_err_before, ba_err_after] = optimizer_.local_bundle_adjustment(map_, K_, 10);
+        if (ba_err_after < ba_err_before && ba_err_after > 0) {
+            cv::Mat t_after = frame->get_translation();
+            double ba_jump = cv::norm(t_after - t_before);
+            if (ba_jump < 0.5) {
+                R_world_ = frame->get_rotation().clone();
+                t_world_ = frame->get_translation().clone();
+            } else {
+                frame->set_pose(R_world_, t_world_);
+            }
+        }
+    }
+
+    cull_map_points(frame);
+}
+
+/// Main SLAM processing pipeline. For each incoming frame:
+/// 1. Extracts features (SuperPoint or ORB)
+/// 2. Matches against reference frame (keyframe when available)
+/// 3. Attempts PnP recovery if matching fails
+/// 4. Handles stationary frames via accelerometer
+/// 5. Estimates motion (3D-3D RANSAC preferred, Essential matrix fallback)
+/// 6. Fuses pose estimate with EKF (constant-velocity model + height prior)
+/// 7. Tracks local map points and refines pose via PnP
+/// 8. Creates keyframes, triangulates new map points, detects loop closures
 bool Slam::process_frame(std::shared_ptr<Frame> frame) {
     if (!frame || frame->image().empty()) return false;
 
@@ -449,6 +730,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
     last_matches_before_.clear();
     last_matches_after_.clear();
 
+    // --- Feature extraction ---
     frame->detect_features(feature_extractor_);
 
     if (frame->keypoints().size() < (size_t)Config::MIN_MATCHES) {
@@ -458,6 +740,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
 
     frame->compute_global_descriptor();
 
+    // --- First frame initialization ---
     if (!last_frame_) {
         frame->set_pose(R_world_, t_world_);
         frame->set_keyframe(true);
@@ -469,6 +752,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
         return true;
     }
 
+    // --- Feature matching against reference frame ---
     ref_frame_ = (last_keyframe_ && !last_keyframe_->descriptors().empty()) ? last_keyframe_ : last_frame_;
 
     std::vector<cv::DMatch> raw_matches;
@@ -477,14 +761,11 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
     last_match_count_ = (int)good_matches.size();
     last_matches_before_ = raw_matches;
 
-    // If keyframe matching is getting weak, try refreshing the keyframe
+    // If keyframe matching is weak, try promoting last_frame as a bridge keyframe
     if (last_match_count_ < Config::MIN_MATCHES && last_frame_ && last_frame_ != ref_frame_) {
-        // Check if last_frame can match (just to know if features are trackable)
         auto temp_matches = match_features(last_frame_->descriptors(), frame->descriptors());
 
         if ((int)temp_matches.size() >= Config::MIN_MATCHES) {
-            // Features ARE trackable, the keyframe is just too far away
-            // Make last_frame_ a retroactive keyframe so we have a fresh reference
             if (!last_frame_->is_keyframe()) {
                 last_frame_->set_keyframe(true);
                 keyframe_count_++;
@@ -500,7 +781,6 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
                 last_keyframe_ = last_frame_;
             }
 
-            // Now retry matching with the fresh keyframe
             ref_frame_ = last_keyframe_;
             raw_matches.clear();
             good_matches = match_features(ref_frame_->descriptors(), frame->descriptors(), &raw_matches);
@@ -509,89 +789,12 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
         }
     }
 
-    if (pnp_recovery_cooldown_ > 0) pnp_recovery_cooldown_--;
+    // --- PnP recovery when tracking is lost ---
+    int pnp_result = try_pnp_recovery(frame);
+    if (pnp_result == 1) return true;
+    if (pnp_result == -1) return false;
 
-    if (last_match_count_ < Config::MIN_MATCHES && pnp_recovery_cooldown_ == 0) {
-        std::vector<cv::Point3f> all_obj_pts;
-        cv::Mat all_mp_descs;
-        {
-            std::lock_guard<std::mutex> lock(map_.mutex());
-            const auto& mps = map_.map_points();
-            for (int mi = 0; mi < (int)mps.size(); mi++) {
-                if (!mps[mi].is_valid() || mps[mi].descriptor().empty()) continue;
-                cv::Point3d p = mps[mi].position();
-                all_obj_pts.emplace_back((float)p.x, (float)p.y, (float)p.z);
-                all_mp_descs.push_back(mps[mi].descriptor());
-            }
-        }
-
-        if (all_mp_descs.rows >= 50 && !frame->descriptors().empty()) {
-            std::vector<cv::Point3f> obj_pts;
-            std::vector<cv::Point2f> img_pts;
-
-            auto flann = cv::FlannBasedMatcher::create();
-            std::vector<std::vector<cv::DMatch>> knn;
-            flann->knnMatch(frame->descriptors(), all_mp_descs, knn, 2);
-
-            for (const auto& m : knn) {
-                if (m.size() >= 2 && m[0].distance < 0.7f * m[1].distance) {
-                    obj_pts.push_back(all_obj_pts[m[0].trainIdx]);
-                    img_pts.push_back(frame->keypoints()[m[0].queryIdx].pt);
-                }
-            }
-
-            if ((int)obj_pts.size() >= 20) {
-                cv::Mat rvec, tvec, inliers;
-                bool ok = cv::solvePnPRansac(obj_pts, img_pts, K_, cv::Mat(),
-                                              rvec, tvec, false,
-                                              300, (float)Config::PNP_RANSAC_THRESHOLD,
-                                              0.99, inliers);
-
-                if (ok && inliers.rows >= 15) {
-                    cv::Mat R_cam;
-                    cv::Rodrigues(rvec, R_cam);
-                    cv::Mat R_pnp = R_cam.t();
-                    cv::Mat t_pnp = -R_cam.t() * tvec;
-
-                    double jump = cv::norm(t_pnp - t_world_);
-                    double inlier_frac = (double)inliers.rows / (double)obj_pts.size();
-
-                    if (jump < 1.5) {
-                        double blend = (jump < 0.1) ? 0.8 : 0.3;
-                        R_world_ = R_pnp.clone();
-                        t_world_ = (1.0 - blend) * t_world_ + blend * t_pnp;
-                        frame->set_pose(R_world_, t_world_);
-                        map_.add_frame(frame);
-
-                        frame->set_keyframe(true);
-                        keyframe_count_++;
-                        create_points_from_depth(frame);
-                        last_keyframe_ = frame;
-                        last_frame_ = frame;
-                        frame_count_++;
-                        if (ekf_initialized_) {
-                            for (int i = 0; i < 3; i++)
-                                ekf_x_.at<double>(i) = t_world_.at<double>(i);
-                            for (int i = 3; i < 6; i++)
-                                ekf_x_.at<double>(i) = 0;
-                        }
-                        last_frame_time_ = frame->timestamp();
-                        pnp_recovery_cooldown_ = 10;
-                        return true;
-                    }
-                }
-            }
-        }
-
-        last_frame_ = frame;
-        return false;
-    }
-
-    if (last_match_count_ < Config::MIN_MATCHES && pnp_recovery_cooldown_ > 0) {
-        last_frame_ = frame;
-        return false;
-    }
-
+    // --- Geometric verification via fundamental matrix ---
     std::vector<cv::Point2f> pts1, pts2;
     extract_matched_points(ref_frame_->keypoints(), frame->keypoints(),
                            good_matches, pts1, pts2);
@@ -624,87 +827,10 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
 
     last_matches_after_ = good_matches;
 
-    bool frame_stationary = is_frame_stationary(frame->timestamp());
-    if (frame_stationary && frame_count_ > 5) {
-        frame->set_pose(R_world_, t_world_);
-        map_.add_frame(frame);
+    // --- Stationary frame handling ---
+    if (process_stationary_frame(frame, good_matches)) return true;
 
-        int tracked = track_local_map(frame);
-
-        if (tracked >= 10) {
-            std::vector<cv::Point3f> obj_pts;
-            std::vector<cv::Point2f> img_pts;
-            {
-                std::lock_guard<std::mutex> lock(map_.mutex());
-                const auto& mps = map_.map_points();
-                const auto& indices = frame->map_point_indices();
-                for (int i = 0; i < (int)indices.size(); i++) {
-                    int mp_id = indices[i];
-                    if (mp_id >= 0 && mp_id < (int)mps.size() && mps[mp_id].is_valid()) {
-                        cv::Point3d p = mps[mp_id].position();
-                        obj_pts.emplace_back((float)p.x, (float)p.y, (float)p.z);
-                        img_pts.push_back(frame->keypoints()[i].pt);
-                    }
-                }
-            }
-            if ((int)obj_pts.size() >= 10) {
-                cv::Mat rvec, tvec, inliers;
-                bool ok = cv::solvePnPRansac(obj_pts, img_pts, K_, cv::Mat(),
-                                              rvec, tvec, false, 100,
-                                              (float)Config::PNP_RANSAC_THRESHOLD,
-                                              0.99, inliers);
-                if (ok && inliers.rows >= 10) {
-                    cv::Mat R_cam;
-                    cv::Rodrigues(rvec, R_cam);
-                    cv::Mat R_pnp = R_cam.t();
-                    R_world_ = R_pnp;
-                    frame->set_pose(R_world_, t_world_);
-                }
-            }
-        }
-
-        if (last_keyframe_) {
-            cv::Mat R_kf = last_keyframe_->get_rotation();
-            cv::Mat R_diff = R_world_.t() * R_kf;
-            cv::Mat rvec_diff;
-            cv::Rodrigues(R_diff, rvec_diff);
-            double angle = cv::norm(rvec_diff);
-            if (angle > 0.25) {
-                frame->set_keyframe(true);
-                keyframe_count_++;
-                create_points_from_depth(frame);
-                last_keyframe_ = frame;
-            }
-        }
-
-        last_frame_ = frame;
-        last_match_count_ = (int)good_matches.size();
-        last_inlier_count_ = last_match_count_;
-        frame_count_++;
-        was_stationary_ = true;
-
-        last_translation_ = cv::Mat::zeros(3, 1, CV_64F);
-
-        if (ekf_initialized_) {
-            ekf_x_.at<double>(3) = 0;
-            ekf_x_.at<double>(4) = 0;
-            ekf_x_.at<double>(5) = 0;
-            ekf_x_.at<double>(0) = t_world_.at<double>(0);
-            ekf_x_.at<double>(1) = t_world_.at<double>(1);
-            ekf_x_.at<double>(2) = t_world_.at<double>(2);
-            for (int i = 3; i < 6; i++) {
-                for (int j = 0; j < 6; j++) {
-                    ekf_P_.at<double>(i, j) = 0;
-                    ekf_P_.at<double>(j, i) = 0;
-                }
-                ekf_P_.at<double>(i, i) = 1e-4;
-            }
-        }
-        last_frame_time_ = frame->timestamp();
-
-        return true;
-    }
-
+    // Post-stationary transition: refresh reference and re-match
     if (was_stationary_ && last_frame_) {
         was_stationary_ = false;
         if (!last_frame_->is_keyframe()) {
@@ -742,7 +868,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
         last_matches_after_ = good_matches;
     }
 
-    // Try 3D-3D rigid transform first (preferred: metric, no scale estimation needed)
+    // --- Motion estimation: 3D-3D preferred, Essential matrix fallback ---
     cv::Mat R_3d, t_3d;
     bool use_3d3d = estimate_motion_3d3d(pts1, pts2, ref_frame_, frame, R_3d, t_3d);
 
@@ -751,11 +877,11 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
     cv::Mat R_new, t_new;
 
     if (use_3d3d) {
-        // Direct metric pose — no scale estimation needed
+        // Direct metric pose from 3D-3D alignment
         R_new = R_ref * R_3d.t();
         t_new = t_ref - R_new * t_3d;
     } else {
-        // Fallback: E-matrix + scale estimation
+        // Essential matrix decomposition + depth-based scale estimation
         cv::Mat R_rel, t_rel, E_mask;
         bool motion_ok = estimate_motion(pts1, pts2, R_rel, t_rel, E_mask);
 
@@ -765,16 +891,9 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
         }
 
         double scale = estimate_scale_from_depth(pts1, pts2, R_rel, t_rel, frame);
-        static int scale_success = 0, scale_fail = 0;
         if (scale <= 0) {
-            if (last_good_scale_ > 0) {
-                scale = last_good_scale_;
-            } else {
-                scale = Config::MOTION_SCALE;
-            }
-            scale_fail++;
+            scale = (last_good_scale_ > 0) ? last_good_scale_ : Config::MOTION_SCALE;
         } else {
-            scale_success++;
             last_good_scale_ = scale;
         }
         R_new = R_ref * R_rel.t();
@@ -782,7 +901,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
         t_new = t_ref - t_motion;
     }
 
-    // EKF predict + update
+    // --- EKF predict + update ---
     {
         if (!ekf_initialized_) {
             ekf_initialize(t_world_, frame->timestamp());
@@ -797,17 +916,20 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
         cv::Mat x_pred_snap = ekf_x_.clone();
         cv::Mat P_pred_snap = ekf_P_.clone();
 
+        // Use tighter measurement noise for 3D-3D (metric) vs E-matrix (noisy scale)
         double sigma_vis = use_3d3d ? Config::EKF_SIGMA_VIS_3D3D : Config::EKF_SIGMA_VIS_EMAT;
 
         cv::Mat ekf_pred_pos = ekf_x_(cv::Range(0, 3), cv::Range(0, 1));
         double innovation = cv::norm(t_new - ekf_pred_pos);
 
+        // Innovation gating: increase measurement noise for large innovations
         if (innovation < Config::EKF_INNOV_GATE) {
             ekf_update_visual(t_new, sigma_vis);
         } else {
             ekf_update_visual(t_new, innovation * 0.5);
         }
 
+        // Height constraint from accelerometer-derived gravity direction
         if (!gravity_world_.empty() && has_initial_height_) {
             ekf_update_height(initial_height_, Config::EKF_SIGMA_HEIGHT);
         }
@@ -818,7 +940,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
         cv::Mat delta_t = ekf_pos - t_world_;
         double step = cv::norm(delta_t);
 
-        // Step clamp
+        // Step clamp: prevent unreasonably large single-frame jumps
         if (step > Config::EKF_MAX_STEP && step > 1e-6) {
             delta_t = delta_t * (Config::EKF_MAX_STEP / step);
             ekf_pos = t_world_ + delta_t;
@@ -831,13 +953,14 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
         last_translation_ = delta_t.clone();
         t_new = ekf_pos;
 
+        // Store EKF snapshot for RTS backward smoother
         EKFSnapshot snap;
         snap.x_pred = x_pred_snap;
         snap.P_pred = P_pred_snap;
-        snap.x_filt = ekf_x_.clone();  // post-clamp state
-        snap.P_filt = P_filt_snap;     // pre-clamp covariance
+        snap.x_filt = ekf_x_.clone();
+        snap.P_filt = P_filt_snap;
         snap.dt = ekf_dt;
-        snap.frame_id = (int)map_.frames_direct().size();  // index this frame WILL get after add_frame
+        snap.frame_id = (int)map_.frames_direct().size();
         ekf_snapshots_.push_back(snap);
     }
 
@@ -849,8 +972,10 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
     frame->set_pose(R_world_, t_world_);
     map_.add_frame(frame);
 
+    // --- Local map tracking ---
     int tracked = track_local_map(frame);
 
+    // Compute reprojection error before PnP refinement
     {
         double fx = K_.at<double>(0,0), fy = K_.at<double>(1,1);
         double cx = K_.at<double>(0,2), cy = K_.at<double>(1,2);
@@ -880,6 +1005,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
         reproj_error_after_ = reproj_error_before_;
     }
 
+    // --- PnP refinement using tracked map points ---
     if (tracked >= 10) {
         std::vector<cv::Point3f> obj_pts;
         std::vector<cv::Point2f> img_pts;
@@ -915,6 +1041,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
                 if (jump < 1.0) {
                     double inlier_ratio = (double)inliers.rows / (double)obj_pts.size();
 
+                    // Adaptive blend: higher inlier ratio → trust PnP more
                     double blend = std::min(0.5, 0.3 + 0.2 * std::max(0.0, std::min(1.0, (inlier_ratio - 0.5) / 0.5)));
 
                     cv::Mat t_blended = (1.0 - blend) * t_world_ + blend * t_pnp;
@@ -930,6 +1057,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
                     t_world_ = t_blended;
                     frame->set_pose(R_world_, t_world_);
 
+                    // Compute reprojection error improvement
                     double fx = K_.at<double>(0,0), fy = K_.at<double>(1,1);
                     double cx = K_.at<double>(0,2), cy = K_.at<double>(1,2);
                     auto compute_reproj = [&](const cv::Mat& R_w, const cv::Mat& t_w) {
@@ -958,138 +1086,36 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
         }
     }
 
-    // Proactive: if match count is getting low, force a keyframe
+    // --- Proactive keyframe: force when match count is getting low ---
     if (!frame->is_keyframe() && last_match_count_ < Config::MIN_MATCHES * 2) {
         int frames_since_kf = frame->id() - last_keyframe_->id();
         if (frames_since_kf >= 5) {
             frame->set_keyframe(true);
             keyframe_count_++;
-
-            if (last_keyframe_) {
-                auto kf_matches = match_features(last_keyframe_->descriptors(), frame->descriptors());
-                if ((int)kf_matches.size() >= Config::MIN_MATCHES) {
-                    triangulate_points(last_keyframe_, frame, kf_matches);
-                }
-            }
-            create_points_from_depth(frame);
-
-            if (Config::ENABLE_LOCAL_BA) {
-                cv::Mat t_before = frame->get_translation().clone();
-                auto [ba_err_before, ba_err_after] = optimizer_.local_bundle_adjustment(map_, K_, 10);
-                if (ba_err_after < ba_err_before && ba_err_after > 0) {
-                    cv::Mat t_after = frame->get_translation();
-                    double ba_jump = cv::norm(t_after - t_before);
-                    if (ba_jump < 0.5) {
-                        R_world_ = frame->get_rotation().clone();
-                        t_world_ = frame->get_translation().clone();
-                    } else {
-                        frame->set_pose(R_world_, t_world_);
-                    }
-                }
-            }
-
-            // Cull grossly wrong map points
-            {
-                std::lock_guard<std::mutex> lock(map_.mutex());
-                auto& mps = map_.map_points();
-                const auto& indices = frame->map_point_indices();
-                cv::Mat R_cur = frame->get_rotation();
-                cv::Mat t_cur = frame->get_translation();
-                cv::Mat R_cam = R_cur.t();
-                cv::Mat t_cam = -R_cam * t_cur;
-                double fx = K_.at<double>(0,0), fy = K_.at<double>(1,1);
-                double cx = K_.at<double>(0,2), cy = K_.at<double>(1,2);
-                for (int i = 0; i < (int)indices.size(); i++) {
-                    int mp_id = indices[i];
-                    if (mp_id >= 0 && mp_id < (int)mps.size() && mps[mp_id].is_valid()) {
-                        cv::Point3d pw = mps[mp_id].position();
-                        cv::Mat Pw = (cv::Mat_<double>(3,1) << pw.x, pw.y, pw.z);
-                        cv::Mat pc = R_cam * Pw + t_cam;
-                        double z = pc.at<double>(2);
-                        if (z < 0.1) { mps[mp_id].set_valid(false); continue; }
-                        double u = fx * pc.at<double>(0) / z + cx;
-                        double v = fy * pc.at<double>(1) / z + cy;
-                        double dx = u - frame->keypoints()[i].pt.x;
-                        double dy = v - frame->keypoints()[i].pt.y;
-                        if (dx*dx + dy*dy > 400.0) {
-                            mps[mp_id].set_valid(false);
-                        }
-                    }
-                }
-            }
-
+            setup_new_keyframe(frame);
             last_keyframe_ = frame;
-
         }
     }
 
+    // --- Regular keyframe decision ---
     if (is_keyframe(frame, last_match_count_)) {
         frame->set_keyframe(true);
         keyframe_count_++;
+        setup_new_keyframe(frame);
 
-        if (last_keyframe_) {
-            auto kf_matches = match_features(last_keyframe_->descriptors(), frame->descriptors());
-            if ((int)kf_matches.size() >= Config::MIN_MATCHES) {
-                triangulate_points(last_keyframe_, frame, kf_matches);
-            }
-        }
-
-        create_points_from_depth(frame);
-
-        if (Config::ENABLE_LOCAL_BA) {
-            cv::Mat t_before = frame->get_translation().clone();
-            auto [ba_err_before, ba_err_after] = optimizer_.local_bundle_adjustment(map_, K_, 10);
-            if (ba_err_after < ba_err_before && ba_err_after > 0) {
-                cv::Mat t_after = frame->get_translation();
-                double ba_jump = cv::norm(t_after - t_before);
-                if (ba_jump < 0.5) {
-                    R_world_ = frame->get_rotation().clone();
-                    t_world_ = frame->get_translation().clone();
-                } else {
-                    frame->set_pose(R_world_, t_world_);
-                }
-            }
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(map_.mutex());
-            auto& mps = map_.map_points();
-            const auto& indices = frame->map_point_indices();
-            cv::Mat R_cur = frame->get_rotation();
-            cv::Mat t_cur = frame->get_translation();
-            cv::Mat R_cam = R_cur.t();
-            cv::Mat t_cam = -R_cam * t_cur;
-            double fx = K_.at<double>(0,0), fy = K_.at<double>(1,1);
-            double cx = K_.at<double>(0,2), cy = K_.at<double>(1,2);
-            for (int i = 0; i < (int)indices.size(); i++) {
-                int mp_id = indices[i];
-                if (mp_id >= 0 && mp_id < (int)mps.size() && mps[mp_id].is_valid()) {
-                    cv::Point3d pw = mps[mp_id].position();
-                    cv::Mat Pw = (cv::Mat_<double>(3,1) << pw.x, pw.y, pw.z);
-                    cv::Mat pc = R_cam * Pw + t_cam;
-                    double z = pc.at<double>(2);
-                    if (z < 0.1) { mps[mp_id].set_valid(false); continue; }
-                    double u = fx * pc.at<double>(0) / z + cx;
-                    double v = fy * pc.at<double>(1) / z + cy;
-                    double dx = u - frame->keypoints()[i].pt.x;
-                    double dy = v - frame->keypoints()[i].pt.y;
-                    if (dx*dx + dy*dy > 400.0) {
-                        mps[mp_id].set_valid(false);
-                    }
-                }
-            }
-        }
-
+        // Periodic PnP refinement against global map
         if (keyframe_count_ % Config::PNP_INTERVAL == 0) {
             run_pnp(frame);
         }
 
+        // --- Loop closure detection and PGO constraint generation ---
         if (keyframe_count_ % Config::LC_CHECK_INTERVAL == 0) {
             LoopResult lr = loop_closer_.detect(frame, map_, K_);
             if (lr.detected) {
                 last_loop_ = true;
                 loop_edges_.emplace_back(lr.matched_frame_id, frame->id());
 
+                // Build 2D-3D correspondences near loop closure frame for PnP verification
                 std::vector<cv::Point3f> lc_obj_pts;
                 std::vector<cv::Point2f> lc_img_pts;
                 {
@@ -1129,6 +1155,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
                     }
                 }
 
+                // Verify loop closure via PnP and create PGO constraint
                 if ((int)lc_obj_pts.size() >= 15) {
                     cv::Mat rvec, tvec, inliers;
                     bool ok = cv::solvePnPRansac(lc_obj_pts, lc_img_pts, K_, cv::Mat(),
@@ -1163,6 +1190,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
             }
         }
 
+        // --- Map point visibility tracking (ORB-SLAM3-style) ---
         {
             std::lock_guard<std::mutex> lock(map_.mutex());
             auto& mps = map_.map_points();
@@ -1184,6 +1212,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
             }
         }
 
+        // Periodic culling of poorly-tracked map points by found ratio
         if (keyframe_count_ % 3 == 0) {
             std::lock_guard<std::mutex> lock(map_.mutex());
             auto& mps = map_.map_points();
@@ -1210,6 +1239,9 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
     return true;
 }
 
+/// Matches descriptors using FLANN (L2 for float/SuperPoint) or BFMatcher (Hamming
+/// for binary/ORB). Applies Lowe's ratio test for L2 or distance threshold for Hamming.
+/// Optionally outputs all raw matches before filtering.
 std::vector<cv::DMatch> Slam::match_features(const cv::Mat& desc1, const cv::Mat& desc2,
                                               std::vector<cv::DMatch>* raw_matches_out) {
     std::vector<cv::DMatch> good_matches;
@@ -1244,6 +1276,7 @@ std::vector<cv::DMatch> Slam::match_features(const cv::Mat& desc1, const cv::Mat
     return good_matches;
 }
 
+/// Extracts 2D point coordinates from keypoints using match indices.
 void Slam::extract_matched_points(const std::vector<cv::KeyPoint>& kp1,
                                    const std::vector<cv::KeyPoint>& kp2,
                                    const std::vector<cv::DMatch>& matches,
@@ -1259,6 +1292,9 @@ void Slam::extract_matched_points(const std::vector<cv::KeyPoint>& kp1,
     }
 }
 
+/// Decomposes the Essential matrix to recover relative rotation and translation.
+/// Uses RANSAC to find the Essential matrix, then cv::recoverPose for decomposition.
+/// Returns false if insufficient inliers or degenerate configuration.
 bool Slam::estimate_motion(const std::vector<cv::Point2f>& pts1,
                              const std::vector<cv::Point2f>& pts2,
                              cv::Mat& R, cv::Mat& t, cv::Mat& mask) {
@@ -1281,6 +1317,8 @@ bool Slam::estimate_motion(const std::vector<cv::Point2f>& pts1,
     return true;
 }
 
+/// Computes the mean symmetric epipolar distance: d(x2, F*x1) for all point pairs.
+/// Used to evaluate geometric consistency of matches before and after filtering.
 double Slam::compute_epipolar_error(const std::vector<cv::Point2f>& pts1,
                                      const std::vector<cv::Point2f>& pts2,
                                      const cv::Mat& F) {
@@ -1306,6 +1344,10 @@ double Slam::compute_epipolar_error(const std::vector<cv::Point2f>& pts1,
     return count > 0 ? total_error / count : 0;
 }
 
+/// Triangulates new 3D map points from matched features between two keyframes.
+/// Uses DLT triangulation, then validates via depth range, reprojection error,
+/// and distance from camera. When Kinect depth is available, replaces triangulated
+/// depth with measured depth for higher accuracy.
 void Slam::triangulate_points(std::shared_ptr<Frame> frame1,
                                 std::shared_ptr<Frame> frame2,
                                 const std::vector<cv::DMatch>& matches) {
@@ -1353,6 +1395,7 @@ void Slam::triangulate_points(std::shared_ptr<Frame> frame1,
                        pts4D.at<float>(1, i) / w,
                        pts4D.at<float>(2, i) / w);
 
+        // Override with Kinect depth when available (more accurate than triangulation)
         if (use_real_depth) {
             int px = (int)std::round(pts2[i].x);
             int py = (int)std::round(pts2[i].y);
@@ -1371,6 +1414,7 @@ void Slam::triangulate_points(std::shared_ptr<Frame> frame1,
             }
         }
 
+        // Validate: point must be in front of both cameras within depth range
         cv::Mat pt_cam1 = R1_cam * (cv::Mat_<double>(3, 1) << pt.x, pt.y, pt.z) + t1_cam;
         cv::Mat pt_cam2 = R2_cam * (cv::Mat_<double>(3, 1) << pt.x, pt.y, pt.z) + t2_cam;
 
@@ -1380,6 +1424,7 @@ void Slam::triangulate_points(std::shared_ptr<Frame> frame1,
         if (z1 < Config::TRIANG_MIN_DEPTH || z1 > Config::TRIANG_MAX_DEPTH) continue;
         if (z2 < Config::TRIANG_MIN_DEPTH || z2 > Config::TRIANG_MAX_DEPTH) continue;
 
+        // Validate reprojection error in both views
         cv::Point2d reproj2 = Optimizer::project_point(pt, R2, t2, K_);
         double dx2 = reproj2.x - pts2[i].x;
         double dy2 = reproj2.y - pts2[i].y;
@@ -1415,6 +1460,7 @@ void Slam::triangulate_points(std::shared_ptr<Frame> frame1,
     }
 }
 
+/// Determines if a frame should be a keyframe based on frame gap and match count.
 bool Slam::is_keyframe(std::shared_ptr<Frame> frame, int match_count) {
     if (!last_keyframe_) return true;
 
@@ -1426,6 +1472,8 @@ bool Slam::is_keyframe(std::shared_ptr<Frame> frame, int match_count) {
     return true;
 }
 
+/// Refines camera pose by blending current estimate with PnP solution from
+/// tracked map points. Uses adaptive blending based on inlier ratio.
 void Slam::run_pnp(std::shared_ptr<Frame> frame) {
     std::vector<cv::Point3f> obj_pts;
     std::vector<cv::Point2f> img_pts;
@@ -1465,6 +1513,7 @@ void Slam::run_pnp(std::shared_ptr<Frame> frame) {
     double jump_dist = cv::norm(t_new - t_cur);
     if (jump_dist > 1.5) return;
 
+    // Blend PnP result with current pose (50/50)
     double blend = 0.5;
 
     cv::Mat t_blended = (1.0 - blend) * t_cur + blend * t_new;
@@ -1485,6 +1534,8 @@ void Slam::run_pnp(std::shared_ptr<Frame> frame) {
     last_pnp_ = true;
 }
 
+/// Creates 3D map points from Kinect depth at keypoint locations that don't
+/// already have an associated map point from triangulation.
 void Slam::create_points_from_depth(std::shared_ptr<Frame> frame) {
     if (!frame->has_real_depth() || frame->depth_map().empty()) return;
 
@@ -1512,6 +1563,7 @@ void Slam::create_points_from_depth(std::shared_ptr<Frame> frame) {
         float z = depth.at<float>(py, px);
         if (z <= 0.1f || z > Config::TRIANG_MAX_CAM_DIST) continue;
 
+        // Back-project pixel to 3D camera coordinates, then transform to world
         double x_cam = (u - Config::CX) * z / Config::FX;
         double y_cam = (v - Config::CY) * z / Config::FY;
         cv::Mat p_cam = (cv::Mat_<double>(3, 1) << x_cam, y_cam, (double)z);
@@ -1537,10 +1589,14 @@ void Slam::create_points_from_depth(std::shared_ptr<Frame> frame) {
     }
 }
 
+/// Stores accelerometer data for stationary detection and gravity estimation.
 void Slam::set_accelerometer_data(const std::vector<AccelSample>& data) {
     accel_data_ = data;
 }
 
+/// Estimates the gravity direction in world frame from accelerometer data.
+/// Averages all accelerometer readings, transforms to world frame, and snaps
+/// to the nearest axis. Sets the initial height for the height constraint.
 void Slam::compute_gravity_direction() {
     if (accel_data_.empty()) return;
 
@@ -1572,10 +1628,13 @@ void Slam::compute_gravity_direction() {
     has_initial_height_ = true;
 }
 
+/// Detects whether the camera is stationary at the given timestamp by analyzing
+/// accelerometer magnitude variance in a 200ms window. Low variance indicates
+/// the robot is not moving.
 bool Slam::is_frame_stationary(double timestamp) const {
     if (accel_data_.empty()) return false;
 
-    const double window = 0.1;  // ±100ms
+    const double window = 0.1;  // +/-100ms
     const double threshold = 0.15;  // accel std threshold
 
     int lo = 0, hi = (int)accel_data_.size() - 1;
@@ -1604,6 +1663,7 @@ bool Slam::is_frame_stationary(double timestamp) const {
     return std::sqrt(var) < threshold;
 }
 
+/// Initializes the 6-DOF EKF state (position + velocity) at the given position.
 void Slam::ekf_initialize(const cv::Mat& pos, double timestamp) {
     ekf_x_ = cv::Mat::zeros(6, 1, CV_64F);
     pos.copyTo(ekf_x_(cv::Range(0, 3), cv::Range(0, 1)));
@@ -1616,22 +1676,27 @@ void Slam::ekf_initialize(const cv::Mat& pos, double timestamp) {
     ekf_initialized_ = true;
 }
 
+/// EKF prediction step: propagates state using constant-velocity model with
+/// velocity decay. Process noise Q is derived from piecewise-constant acceleration.
 void Slam::ekf_predict(double dt) {
     if (!ekf_initialized_ || dt <= 0) return;
 
     double decay = Config::EKF_VEL_DECAY;
 
+    // Propagate state: position += velocity * dt, velocity *= decay
     for (int i = 0; i < 3; i++) {
         ekf_x_.at<double>(i) += ekf_x_.at<double>(i + 3) * dt;
         ekf_x_.at<double>(i + 3) *= decay;
     }
 
+    // State transition matrix F
     cv::Mat F = cv::Mat::eye(6, 6, CV_64F);
     for (int i = 0; i < 3; i++) {
         F.at<double>(i, i + 3) = dt;
         F.at<double>(i + 3, i + 3) = decay;
     }
 
+    // Process noise Q from piecewise-constant acceleration model
     double sigma_a = Config::EKF_PROCESS_ACCEL;
     cv::Mat Q = cv::Mat::zeros(6, 6, CV_64F);
     for (int i = 0; i < 3; i++) {
@@ -1644,28 +1709,35 @@ void Slam::ekf_predict(double dt) {
     ekf_P_ = F * ekf_P_ * F.t() + Q;
 }
 
+/// EKF update step for visual odometry measurement (3D position).
+/// Uses Joseph form for numerical stability: P = (I-KH)*P*(I-KH)' + K*R*K'
 void Slam::ekf_update_visual(const cv::Mat& z_pos, double sigma_vis) {
     if (!ekf_initialized_) return;
 
+    // Observation matrix: we observe position directly (first 3 states)
     cv::Mat H = cv::Mat::zeros(3, 6, CV_64F);
     for (int i = 0; i < 3; i++) H.at<double>(i, i) = 1.0;
 
     cv::Mat R = cv::Mat::zeros(3, 3, CV_64F);
     for (int i = 0; i < 3; i++) R.at<double>(i, i) = sigma_vis * sigma_vis;
 
-    cv::Mat y = z_pos - H * ekf_x_;
-    cv::Mat S = H * ekf_P_ * H.t() + R;
-    cv::Mat K = ekf_P_ * H.t() * S.inv();
+    cv::Mat y = z_pos - H * ekf_x_;         // Innovation
+    cv::Mat S = H * ekf_P_ * H.t() + R;     // Innovation covariance
+    cv::Mat K = ekf_P_ * H.t() * S.inv();   // Kalman gain
     ekf_x_ = ekf_x_ + K * y;
 
+    // Joseph form covariance update
     cv::Mat I = cv::Mat::eye(6, 6, CV_64F);
     cv::Mat IKH = I - K * H;
     ekf_P_ = IKH * ekf_P_ * IKH.t() + K * R * K.t();
 }
 
+/// EKF update step for height constraint along gravity direction.
+/// Constrains the camera height to remain near the initial height (robot on flat floor).
 void Slam::ekf_update_height(double h_target, double sigma_h) {
     if (!ekf_initialized_ || gravity_world_.empty()) return;
 
+    // H maps state to height along gravity: h = g^T * position
     cv::Mat H = cv::Mat::zeros(1, 6, CV_64F);
     for (int i = 0; i < 3; i++) H.at<double>(0, i) = gravity_world_.at<double>(i);
 
@@ -1684,6 +1756,8 @@ void Slam::ekf_update_height(double h_target, double sigma_h) {
     ekf_P_ = IKH * ekf_P_ * IKH.t() + K * R_h * K.t();
 }
 
+/// Runs post-hoc pose graph optimization with g2o using accumulated loop constraints
+/// and the height prior. Called after all frames are processed.
 void Slam::run_posthoc_pgo() {
     if (!has_initial_height_ && loop_constraints_.empty()) {
         return;
@@ -1693,6 +1767,10 @@ void Slam::run_posthoc_pgo() {
         initial_height_, has_initial_height_);
 }
 
+/// Rauch-Tung-Striebel (RTS) backward smoother. Uses stored EKF snapshots
+/// (predicted and filtered states/covariances) to optimally smooth the entire
+/// trajectory after all frames are processed. Applies smoothed positions to
+/// frame poses in the map.
 void Slam::run_rts_smoother() {
     int N = (int)ekf_snapshots_.size();
     if (N < 3) {
@@ -1701,16 +1779,16 @@ void Slam::run_rts_smoother() {
 
     double decay = Config::EKF_VEL_DECAY;
 
-    // Smoothed states: initialize last frame = filtered
+    // Initialize: last smoothed state = last filtered state
     std::vector<cv::Mat> x_smooth(N), P_smooth(N);
     x_smooth[N-1] = ekf_snapshots_[N-1].x_filt.clone();
     P_smooth[N-1] = ekf_snapshots_[N-1].P_filt.clone();
 
-    // Backward pass
+    // Backward pass: compute smoother gain and propagate corrections
     for (int k = N - 2; k >= 0; k--) {
         double dt = ekf_snapshots_[k+1].dt;
 
-        // Reconstruct F_{k+1} transition matrix
+        // Reconstruct transition matrix F for this time step
         cv::Mat F = cv::Mat::eye(6, 6, CV_64F);
         for (int i = 0; i < 3; i++) {
             F.at<double>(i, i + 3) = dt;

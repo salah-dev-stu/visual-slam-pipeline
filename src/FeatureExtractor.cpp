@@ -8,6 +8,7 @@
 #include <cmath>
 #include <numeric>
 
+/// Constructs the feature extractor with ORB as the default backend.
 FeatureExtractor::FeatureExtractor()
     : use_superpoint_(false) {
     orb_ = cv::ORB::create(Config::NUM_FEATURES, Config::SCALE_FACTOR, Config::NUM_LEVELS);
@@ -15,6 +16,9 @@ FeatureExtractor::FeatureExtractor()
 
 FeatureExtractor::~FeatureExtractor() = default;
 
+/// Initializes the SuperPoint ONNX Runtime session. Attempts GPU (CUDA)
+/// execution first and falls back to multi-threaded CPU if unavailable.
+/// Returns true on success; on failure, ORB is used as fallback.
 bool FeatureExtractor::init(const std::string& model_path) {
     try {
         env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "SuperPoint");
@@ -39,6 +43,9 @@ bool FeatureExtractor::init(const std::string& model_path) {
     }
 }
 
+/// Extracts keypoints and descriptors from the given image. Checks the binary
+/// cache first (keyed by sequential frame index); on miss, runs SuperPoint or
+/// ORB, then stores the result for future caching.
 void FeatureExtractor::extract(const cv::Mat& image,
                                 std::vector<cv::KeyPoint>& keypoints,
                                 cv::Mat& descriptors) {
@@ -73,6 +80,10 @@ void FeatureExtractor::extract(const cv::Mat& image,
     }
 }
 
+/// Runs SuperPoint inference via ONNX Runtime. Pads the image to multiples of
+/// 8, feeds it through the network, decodes the 65-channel semi-dense heatmap
+/// via softmax, applies NMS, then bilinearly interpolates the 256-D descriptor
+/// coarse grid to obtain per-keypoint descriptors (L2-normalized).
 void FeatureExtractor::extract_superpoint(const cv::Mat& gray,
                                            std::vector<cv::KeyPoint>& keypoints,
                                            cv::Mat& descriptors) {
@@ -195,12 +206,16 @@ void FeatureExtractor::extract_superpoint(const cv::Mat& gray,
     }
 }
 
+/// Fallback extraction using OpenCV ORB (used when SuperPoint is unavailable).
 void FeatureExtractor::extract_orb(const cv::Mat& gray,
                                     std::vector<cv::KeyPoint>& keypoints,
                                     cv::Mat& descriptors) {
     orb_->detectAndCompute(gray, cv::noArray(), keypoints, descriptors);
 }
 
+/// Non-maximum suppression on the SuperPoint heatmap. Sorts candidates by
+/// score, greedily selects the top-scoring point, suppresses all neighbors
+/// within the given radius, and repeats up to max_keypoints.
 void FeatureExtractor::nms(const cv::Mat& heatmap, int radius,
                             std::vector<cv::KeyPoint>& keypoints, int max_keypoints) {
     keypoints.clear();
@@ -243,10 +258,14 @@ void FeatureExtractor::nms(const cv::Mat& heatmap, int radius,
     }
 }
 
+/// Sets the file path for the binary feature cache (load/save).
 void FeatureExtractor::set_cache_path(const std::string& path) {
     cache_path_ = path;
 }
 
+/// Loads pre-computed keypoints and descriptors from a binary cache file.
+/// Format: magic(SPCF) | version | N entries, each containing keypoints
+/// (x,y,size,angle,response,octave,class_id) and a descriptor matrix.
 bool FeatureExtractor::load_cache() {
     if (cache_path_.empty()) return false;
 
@@ -302,6 +321,7 @@ bool FeatureExtractor::load_cache() {
     return true;
 }
 
+/// Writes all cached keypoints and descriptors to the binary cache file.
 bool FeatureExtractor::save_cache() {
     if (cache_path_.empty() || cache_.empty()) return false;
 

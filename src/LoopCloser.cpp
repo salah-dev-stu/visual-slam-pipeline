@@ -9,6 +9,10 @@
 
 LoopCloser::LoopCloser() : loop_count_(0) {}
 
+/// Detects loop closures by matching the current frame's descriptors against
+/// distant keyframes. Uses KNN ratio-test filtering followed by Essential
+/// matrix RANSAC verification. Returns the best match (highest inlier count)
+/// with its relative pose, or detected=false if no loop is found.
 LoopResult LoopCloser::detect(const std::shared_ptr<Frame>& current_frame,
                                const Map& map,
                                const cv::Mat& K) {
