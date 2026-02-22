@@ -38,6 +38,7 @@ struct DepthInfo {
     std::string path;
 };
 
+/// Parses the TUM-format depth.txt file and returns a sorted list of depth image paths.
 std::vector<DepthInfo> load_depth_list(const std::string& dataset_path) {
     std::vector<DepthInfo> depths;
     std::string depth_txt = dataset_path + "depth.txt";
@@ -62,6 +63,8 @@ std::vector<DepthInfo> load_depth_list(const std::string& dataset_path) {
     return depths;
 }
 
+/// Finds the depth image with the closest timestamp to the given RGB timestamp
+/// using binary search. Returns empty string if no match within max_diff seconds.
 std::string find_closest_depth(double rgb_ts, const std::vector<DepthInfo>& depths,
                                 double max_diff = 0.02) {
     if (depths.empty()) return "";
@@ -81,6 +84,7 @@ std::string find_closest_depth(double rgb_ts, const std::vector<DepthInfo>& dept
     return "";
 }
 
+/// Loads RGB-depth frame pairs from TUM associations.txt (pre-matched pairs).
 std::vector<ImageInfo> load_from_associations(const std::string& dataset_path) {
     std::vector<ImageInfo> images;
     std::string assoc_file = dataset_path + "associations.txt";
@@ -112,6 +116,7 @@ struct AccelSample {
     double ax, ay, az;
 };
 
+/// Loads IMU accelerometer readings from the TUM accelerometer.txt file.
 std::vector<AccelSample> load_accelerometer(const std::string& dataset_path) {
     std::vector<AccelSample> data;
     std::string accel_file = dataset_path + "accelerometer.txt";
@@ -133,6 +138,8 @@ std::vector<AccelSample> load_accelerometer(const std::string& dataset_path) {
     return data;
 }
 
+/// Loads the full image list with associated depth paths. Tries associations.txt
+/// first, then rgb.txt with timestamp-matched depth, then falls back to directory scan.
 std::vector<ImageInfo> load_image_list(const std::string& dataset_path) {
     // Try associations.txt first (guaranteed RGB-depth pairing)
     auto images = load_from_associations(dataset_path);
@@ -197,13 +204,14 @@ std::vector<ImageInfo> load_image_list(const std::string& dataset_path) {
     return images;
 }
 
-// Ground truth
+/// Ground truth pose from TUM groundtruth.txt (timestamp + position + quaternion).
 struct GTPose {
     double timestamp;
     double tx, ty, tz;
     double qx, qy, qz, qw;
 };
 
+/// Parses TUM groundtruth.txt and returns sorted ground truth poses.
 std::vector<GTPose> load_ground_truth(const std::string& dataset_path) {
     std::vector<GTPose> gt;
     std::ifstream ifs(dataset_path + "groundtruth.txt");
@@ -222,6 +230,7 @@ std::vector<GTPose> load_ground_truth(const std::string& dataset_path) {
     return gt;
 }
 
+/// Binary-searches the ground truth list for the closest timestamp to ts.
 GTPose find_closest_gt(double ts, const std::vector<GTPose>& gt) {
     int lo = 0, hi = (int)gt.size() - 1;
     while (lo < hi) {
@@ -243,6 +252,9 @@ struct AlignmentResult {
     std::vector<cv::Point3d> gt_trajectory;
 };
 
+/// Computes Absolute Trajectory Error (ATE) using Umeyama alignment (SVD-based).
+/// Finds the optimal similarity transform (scale + rotation + translation) mapping
+/// estimated poses to ground truth, then returns the RMSE of aligned residuals.
 AlignmentResult compute_ate(const std::vector<std::pair<double, cv::Point3d>>& est_poses,
                              const std::vector<GTPose>& gt_all) {
     AlignmentResult result;
@@ -319,7 +331,7 @@ AlignmentResult compute_ate(const std::vector<std::pair<double, cv::Point3d>>& e
     return result;
 }
 
-// RPE
+/// Relative Pose Error metrics: per-step translation and rotation errors.
 struct RPEResult {
     double rpe_trans_rmse;   // translation RPE RMSE (m/step)
     double rpe_trans_mean;   // translation RPE mean
@@ -329,6 +341,8 @@ struct RPEResult {
     int num_pairs;
 };
 
+/// Computes Relative Pose Error (RPE) by comparing per-step displacements between
+/// estimated and ground truth trajectories. Returns RMSE, mean, and max translation errors.
 RPEResult compute_rpe(const std::vector<std::pair<double, cv::Point3d>>& est_poses,
                        const std::vector<GTPose>& gt_all,
                        int delta = 1) {
@@ -374,6 +388,7 @@ RPEResult compute_rpe(const std::vector<std::pair<double, cv::Point3d>>& est_pos
     return result;
 }
 
+/// Saves estimated trajectory in TUM format (timestamp tx ty tz qx qy qz qw).
 void save_trajectory(const std::string& path,
                      const std::vector<std::pair<double, cv::Point3d>>& poses) {
     std::ofstream ofs(path);
@@ -384,6 +399,7 @@ void save_trajectory(const std::string& path,
     }
 }
 
+/// Converts a 3x3 rotation matrix to quaternion (qx, qy, qz, qw) representation.
 void rotation_to_quaternion(const cv::Mat& R, double& qx, double& qy, double& qz, double& qw) {
     double trace = R.at<double>(0,0) + R.at<double>(1,1) + R.at<double>(2,2);
     if (trace > 0) {
@@ -413,6 +429,7 @@ void rotation_to_quaternion(const cv::Mat& R, double& qx, double& qy, double& qz
     }
 }
 
+/// Saves the full trajectory with rotation (as quaternion) in TUM format.
 void save_trajectory_full(const std::string& path,
                           const std::vector<std::shared_ptr<Frame>>& frames) {
     std::ofstream ofs(path);
@@ -428,6 +445,8 @@ void save_trajectory_full(const std::string& path,
     }
 }
 
+/// Downsamples a point cloud with distance-adaptive voxel sizes: finer resolution
+/// near the camera trajectory (1cm) and coarser resolution far away (20cm).
 std::vector<cv::Point3d> adaptive_downsample(const std::vector<cv::Point3d>& pts,
                                               const std::vector<cv::Point3d>& traj) {
     if (pts.empty()) return pts;
@@ -487,6 +506,9 @@ using KDTree3D = nanoflann::KDTreeSingleIndexAdaptor<
     nanoflann::L2_Simple_Adaptor<double, EigenPointCloud>,
     EigenPointCloud, 3>;
 
+/// Removes statistical outliers from a point cloud using k-NN mean distance analysis.
+/// Points whose mean neighbor distance exceeds (global_mean + std_ratio * global_std)
+/// are discarded.
 std::vector<cv::Point3d> statistical_outlier_removal(const std::vector<cv::Point3d>& pts,
                                                        int k_neighbors = 20,
                                                        double std_ratio = 1.0) {
@@ -540,6 +562,9 @@ std::vector<cv::Point3d> statistical_outlier_removal(const std::vector<cv::Point
     return result;
 }
 
+/// Filters points that lie on surfaces by computing local covariance eigenvalues.
+/// Keeps only points with sufficient anisotropy (planar/linear neighborhoods),
+/// removing isolated or volumetric noise clusters.
 std::vector<cv::Point3d> surface_aware_filter(const std::vector<cv::Point3d>& pts,
                                                 int k_neighbors = 25,
                                                 double min_anisotropy = 0.3) {
@@ -616,6 +641,7 @@ std::vector<cv::Point3d> surface_aware_filter(const std::vector<cv::Point3d>& pt
     return result;
 }
 
+/// Estimates surface normals for each point via PCA on k nearest neighbors.
 std::vector<Eigen::Vector3d> estimate_normals(const EigenPointCloud& cloud,
                                                 const KDTree3D& tree,
                                                 int k = 20) {
@@ -645,6 +671,7 @@ std::vector<Eigen::Vector3d> estimate_normals(const EigenPointCloud& cloud,
     return normals;
 }
 
+/// Convenience wrapper: builds a KD-tree and estimates normals for cv::Point3d points.
 std::vector<cv::Point3d> compute_normals(const std::vector<cv::Point3d>& pts, int k = 20) {
     EigenPointCloud cloud;
     cloud.pts.resize(pts.size());
@@ -659,6 +686,9 @@ std::vector<cv::Point3d> compute_normals(const std::vector<cv::Point3d>& pts, in
     return result;
 }
 
+/// Generates a triangle mesh from a point cloud using local fan triangulation.
+/// For each point, sorts coplanar neighbors by angle and creates a triangle fan,
+/// skipping edges that exceed max_edge length or span large angular gaps.
 void compute_mesh(const std::vector<cv::Point3d>& pts,
                   const std::vector<cv::Point3d>& normals,
                   std::vector<cv::Point3d>& tri_verts,
@@ -743,6 +773,9 @@ void compute_mesh(const std::vector<cv::Point3d>& pts,
     }
 }
 
+/// Projects a query point onto the local Moving Least Squares (MLS) surface.
+/// Fits a weighted quadratic polynomial to nearby points in tangent-plane coordinates,
+/// then evaluates the height at the query's projection onto the local frame.
 Eigen::Vector3d project_to_mls(const Eigen::Vector3d& query,
                                  const EigenPointCloud& cloud,
                                  const std::vector<Eigen::Vector3d>& normals,
@@ -807,6 +840,9 @@ Eigen::Vector3d project_to_mls(const Eigen::Vector3d& query,
     return centroid + u_q * u_axis + v_q * v_axis + h_q * plane_normal;
 }
 
+/// Densifies a point cloud by filling gaps on detected planar surfaces.
+/// For each point, fits a local plane via PCA on coplanar neighbors and inserts
+/// new points on a regular grid within the neighborhood extent.
 std::vector<cv::Point3d> densify_surfaces(const std::vector<cv::Point3d>& pts,
                                             double search_radius = 0.12,
                                             double fill_step = 0.05,
@@ -951,6 +987,8 @@ struct SharedState {
 
 Viewer* g_viewer = nullptr;
 
+/// Background thread that filters the dense point cloud by bounding-box clipping
+/// around the camera trajectory. Waits on a condition variable for filter requests.
 void point_cloud_filter_thread(SharedState& state) {
     while (!state.filter_shutdown) {
         std::unique_lock<std::mutex> lock(state.filter_mutex);
@@ -992,6 +1030,9 @@ void point_cloud_filter_thread(SharedState& state) {
     }
 }
 
+/// Main SLAM processing loop (runs in background thread). Processes all frames,
+/// accumulates the dense point cloud from Kinect depth, runs post-hoc RTS smoothing,
+/// evaluates ATE, and saves trajectory and PLY outputs.
 void slam_processing_thread(const std::vector<ImageInfo>& images,
                              Slam& slam,
                              Viewer& viewer,
@@ -1437,6 +1478,8 @@ void slam_processing_thread(const std::vector<ImageInfo>& images,
 }
 
 
+/// Entry point: parses arguments, loads the dataset, launches the Pangolin viewer,
+/// and runs the SLAM pipeline in a background thread with restart support.
 int main(int argc, char** argv) {
     std::string dataset_path = Config::DATASET_PATH;
     std::string model_dir = "models";

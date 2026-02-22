@@ -499,6 +499,35 @@ void Slam::cull_map_points(std::shared_ptr<Frame> frame) {
     }
 }
 
+/// Unified PnP solver: runs solvePnPRansac on the given 3D-2D correspondences,
+/// converts the result from camera frame to world frame (R_world, t_world).
+/// Returns success=false if PnP fails or inlier count is below min_inliers.
+Slam::PnPResult Slam::solve_pnp(const std::vector<cv::Point3f>& obj_pts,
+                                  const std::vector<cv::Point2f>& img_pts,
+                                  int ransac_iters, int min_inliers) {
+    PnPResult result;
+    result.success = false;
+    result.inlier_count = 0;
+
+    if ((int)obj_pts.size() < min_inliers) return result;
+
+    cv::Mat rvec, tvec, inliers;
+    bool ok = cv::solvePnPRansac(obj_pts, img_pts, K_, cv::Mat(),
+                                  rvec, tvec, false,
+                                  ransac_iters, (float)Config::PNP_RANSAC_THRESHOLD,
+                                  0.99, inliers);
+    if (!ok || inliers.rows < min_inliers) return result;
+
+    cv::Mat R_cam;
+    cv::Rodrigues(rvec, R_cam);
+
+    result.success = true;
+    result.R_world = R_cam.t();
+    result.t_world = -R_cam.t() * tvec;
+    result.inlier_count = inliers.rows;
+    return result;
+}
+
 /// Attempts PnP-based tracking recovery when feature matching with the reference
 /// frame fails. Matches current frame descriptors against all valid map points
 /// using FLANN, then solves PnP to recover the camera pose.
@@ -545,25 +574,16 @@ int Slam::try_pnp_recovery(std::shared_ptr<Frame> frame) {
         }
 
         if ((int)obj_pts.size() >= 20) {
-            cv::Mat rvec, tvec, inliers;
-            bool ok = cv::solvePnPRansac(obj_pts, img_pts, K_, cv::Mat(),
-                                          rvec, tvec, false,
-                                          300, (float)Config::PNP_RANSAC_THRESHOLD,
-                                          0.99, inliers);
+            auto pnp = solve_pnp(obj_pts, img_pts, 300, 15);
 
-            if (ok && inliers.rows >= 15) {
-                cv::Mat R_cam;
-                cv::Rodrigues(rvec, R_cam);
-                cv::Mat R_pnp = R_cam.t();
-                cv::Mat t_pnp = -R_cam.t() * tvec;
-
-                double jump = cv::norm(t_pnp - t_world_);
+            if (pnp.success) {
+                double jump = cv::norm(pnp.t_world - t_world_);
 
                 if (jump < 1.5) {
                     // Blend recovered pose with current estimate
                     double blend = (jump < 0.1) ? 0.8 : 0.3;
-                    R_world_ = R_pnp.clone();
-                    t_world_ = (1.0 - blend) * t_world_ + blend * t_pnp;
+                    R_world_ = pnp.R_world.clone();
+                    t_world_ = (1.0 - blend) * t_world_ + blend * pnp.t_world;
                     frame->set_pose(R_world_, t_world_);
                     map_.add_frame(frame);
 
@@ -622,19 +642,10 @@ bool Slam::process_stationary_frame(std::shared_ptr<Frame> frame,
                 }
             }
         }
-        if ((int)obj_pts.size() >= 10) {
-            cv::Mat rvec, tvec, inliers;
-            bool ok = cv::solvePnPRansac(obj_pts, img_pts, K_, cv::Mat(),
-                                          rvec, tvec, false, 100,
-                                          (float)Config::PNP_RANSAC_THRESHOLD,
-                                          0.99, inliers);
-            if (ok && inliers.rows >= 10) {
-                cv::Mat R_cam;
-                cv::Rodrigues(rvec, R_cam);
-                cv::Mat R_pnp = R_cam.t();
-                R_world_ = R_pnp;
-                frame->set_pose(R_world_, t_world_);
-            }
+        auto pnp = solve_pnp(obj_pts, img_pts, 100, 10);
+        if (pnp.success) {
+            R_world_ = pnp.R_world;
+            frame->set_pose(R_world_, t_world_);
         }
     }
 
@@ -711,6 +722,79 @@ void Slam::setup_new_keyframe(std::shared_ptr<Frame> frame) {
     }
 
     cull_map_points(frame);
+}
+
+/// Detects loop closures by matching the current frame's global descriptor against
+/// previous keyframes, then verifies via PnP on 2D-3D correspondences near the
+/// matched frame. If verified, creates a PGO constraint for post-hoc optimization.
+void Slam::handle_loop_closure(std::shared_ptr<Frame> frame) {
+    LoopResult lr = loop_closer_.detect(frame, map_, K_);
+    if (!lr.detected) return;
+
+    last_loop_ = true;
+    loop_edges_.emplace_back(lr.matched_frame_id, frame->id());
+
+    // Build 2D-3D correspondences from map points observed near the matched frame
+    std::vector<cv::Point3f> lc_obj_pts;
+    std::vector<cv::Point2f> lc_img_pts;
+    {
+        std::lock_guard<std::mutex> lock(map_.mutex());
+        const auto& mps = map_.map_points();
+
+        cv::Mat mp_descs;
+        std::vector<int> mp_ids_vec;
+        for (int mi = 0; mi < (int)mps.size(); mi++) {
+            if (!mps[mi].is_valid() || mps[mi].descriptor().empty()) continue;
+            const auto& obs = mps[mi].observations();
+            bool near_lc = false;
+            for (const auto& ob : obs) {
+                if (std::abs(ob.first - lr.matched_frame_id) < 30) {
+                    near_lc = true;
+                    break;
+                }
+            }
+            if (!near_lc) continue;
+            mp_descs.push_back(mps[mi].descriptor());
+            mp_ids_vec.push_back(mi);
+        }
+
+        if (mp_descs.rows >= 20 && !frame->descriptors().empty()) {
+            auto flann = cv::FlannBasedMatcher::create();
+            std::vector<std::vector<cv::DMatch>> knn;
+            flann->knnMatch(frame->descriptors(), mp_descs, knn, 2);
+
+            for (const auto& m : knn) {
+                if (m.size() >= 2 && m[0].distance < 0.7f * m[1].distance) {
+                    int mp_id = mp_ids_vec[m[0].trainIdx];
+                    cv::Point3d p = mps[mp_id].position();
+                    lc_obj_pts.emplace_back((float)p.x, (float)p.y, (float)p.z);
+                    lc_img_pts.push_back(frame->keypoints()[m[0].queryIdx].pt);
+                }
+            }
+        }
+    }
+
+    // Verify loop closure via PnP and create PGO constraint
+    auto pnp = solve_pnp(lc_obj_pts, lc_img_pts, 300, 15);
+    if (!pnp.success) return;
+
+    double jump = cv::norm(pnp.t_world - t_world_);
+    if (jump >= 0.5 || jump <= 0.01) return;
+
+    auto matched_frame = map_.get_frame(lr.matched_frame_id);
+    if (!matched_frame) return;
+
+    cv::Mat R_from = matched_frame->get_rotation();
+    cv::Mat t_from = matched_frame->get_translation();
+
+    LoopConstraint lc_constraint;
+    lc_constraint.from_id = lr.matched_frame_id;
+    lc_constraint.to_id = frame->id();
+    lc_constraint.R_rel = R_from.t() * pnp.R_world;
+    lc_constraint.t_rel = R_from.t() * (pnp.t_world - t_from);
+    lc_constraint.trans_sigma = Config::PGO_LC_TRANS_SIGMA;
+    lc_constraint.rot_sigma = Config::PGO_LC_ROT_SIGMA;
+    loop_constraints_.push_back(lc_constraint);
 }
 
 /// Main SLAM processing pipeline. For each incoming frame:
@@ -1023,65 +1107,54 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
             }
         }
 
-        if ((int)obj_pts.size() >= 10) {
-            cv::Mat R_prev_pose = R_world_.clone();
-            cv::Mat t_prev_pose = t_world_.clone();
-            cv::Mat rvec, tvec, inliers;
-            bool ok = cv::solvePnPRansac(obj_pts, img_pts, K_, cv::Mat(),
-                                          rvec, tvec, false,
-                                          100, (float)Config::PNP_RANSAC_THRESHOLD,
-                                          0.99, inliers);
-            if (ok && inliers.rows >= 10) {
-                cv::Mat R_cam;
-                cv::Rodrigues(rvec, R_cam);
-                cv::Mat R_pnp = R_cam.t();
-                cv::Mat t_pnp = -R_cam.t() * tvec;
+        cv::Mat R_prev_pose = R_world_.clone();
+        cv::Mat t_prev_pose = t_world_.clone();
+        auto pnp = solve_pnp(obj_pts, img_pts, 100, 10);
+        if (pnp.success) {
+            double jump = cv::norm(pnp.t_world - t_world_);
+            if (jump < 1.0) {
+                double inlier_ratio = (double)pnp.inlier_count / (double)obj_pts.size();
 
-                double jump = cv::norm(t_pnp - t_world_);
-                if (jump < 1.0) {
-                    double inlier_ratio = (double)inliers.rows / (double)obj_pts.size();
+                // Adaptive blend: higher inlier ratio → trust PnP more
+                double blend = std::min(0.5, 0.3 + 0.2 * std::max(0.0, std::min(1.0, (inlier_ratio - 0.5) / 0.5)));
 
-                    // Adaptive blend: higher inlier ratio → trust PnP more
-                    double blend = std::min(0.5, 0.3 + 0.2 * std::max(0.0, std::min(1.0, (inlier_ratio - 0.5) / 0.5)));
+                cv::Mat t_blended = (1.0 - blend) * t_world_ + blend * pnp.t_world;
 
-                    cv::Mat t_blended = (1.0 - blend) * t_world_ + blend * t_pnp;
+                cv::Mat rvec_cur, rvec_pnp_r;
+                cv::Rodrigues(R_world_, rvec_cur);
+                cv::Rodrigues(pnp.R_world, rvec_pnp_r);
+                cv::Mat rvec_blended = (1.0 - blend) * rvec_cur + blend * rvec_pnp_r;
+                cv::Mat R_blended;
+                cv::Rodrigues(rvec_blended, R_blended);
 
-                    cv::Mat rvec_cur, rvec_pnp_r;
-                    cv::Rodrigues(R_world_, rvec_cur);
-                    cv::Rodrigues(R_pnp, rvec_pnp_r);
-                    cv::Mat rvec_blended = (1.0 - blend) * rvec_cur + blend * rvec_pnp_r;
-                    cv::Mat R_blended;
-                    cv::Rodrigues(rvec_blended, R_blended);
+                R_world_ = R_blended;
+                t_world_ = t_blended;
+                frame->set_pose(R_world_, t_world_);
 
-                    R_world_ = R_blended;
-                    t_world_ = t_blended;
-                    frame->set_pose(R_world_, t_world_);
-
-                    // Compute reprojection error improvement
-                    double fx = K_.at<double>(0,0), fy = K_.at<double>(1,1);
-                    double cx = K_.at<double>(0,2), cy = K_.at<double>(1,2);
-                    auto compute_reproj = [&](const cv::Mat& R_w, const cv::Mat& t_w) {
-                        cv::Mat Rc = R_w.t();
-                        cv::Mat tc = -Rc * t_w;
-                        double sum = 0;
-                        int cnt = 0;
-                        for (int pi = 0; pi < (int)obj_pts.size(); pi++) {
-                            cv::Mat pw = (cv::Mat_<double>(3,1) << obj_pts[pi].x, obj_pts[pi].y, obj_pts[pi].z);
-                            cv::Mat pc = Rc * pw + tc;
-                            double z = pc.at<double>(2);
-                            if (z < 0.01) continue;
-                            double u = fx * pc.at<double>(0) / z + cx;
-                            double v = fy * pc.at<double>(1) / z + cy;
-                            double dx = u - img_pts[pi].x;
-                            double dy = v - img_pts[pi].y;
-                            sum += std::sqrt(dx*dx + dy*dy);
-                            cnt++;
-                        }
-                        return cnt > 0 ? sum / cnt : 0.0;
-                    };
-                    reproj_error_before_ = compute_reproj(R_prev_pose, t_prev_pose);
-                    reproj_error_after_ = compute_reproj(R_world_, t_world_);
-                }
+                // Compute reprojection error improvement
+                double fx = K_.at<double>(0,0), fy = K_.at<double>(1,1);
+                double cx = K_.at<double>(0,2), cy = K_.at<double>(1,2);
+                auto compute_reproj = [&](const cv::Mat& R_w, const cv::Mat& t_w) {
+                    cv::Mat Rc = R_w.t();
+                    cv::Mat tc = -Rc * t_w;
+                    double sum = 0;
+                    int cnt = 0;
+                    for (int pi = 0; pi < (int)obj_pts.size(); pi++) {
+                        cv::Mat pw = (cv::Mat_<double>(3,1) << obj_pts[pi].x, obj_pts[pi].y, obj_pts[pi].z);
+                        cv::Mat pc = Rc * pw + tc;
+                        double z = pc.at<double>(2);
+                        if (z < 0.01) continue;
+                        double u = fx * pc.at<double>(0) / z + cx;
+                        double v = fy * pc.at<double>(1) / z + cy;
+                        double dx = u - img_pts[pi].x;
+                        double dy = v - img_pts[pi].y;
+                        sum += std::sqrt(dx*dx + dy*dy);
+                        cnt++;
+                    }
+                    return cnt > 0 ? sum / cnt : 0.0;
+                };
+                reproj_error_before_ = compute_reproj(R_prev_pose, t_prev_pose);
+                reproj_error_after_ = compute_reproj(R_world_, t_world_);
             }
         }
     }
@@ -1110,84 +1183,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
 
         // --- Loop closure detection and PGO constraint generation ---
         if (keyframe_count_ % Config::LC_CHECK_INTERVAL == 0) {
-            LoopResult lr = loop_closer_.detect(frame, map_, K_);
-            if (lr.detected) {
-                last_loop_ = true;
-                loop_edges_.emplace_back(lr.matched_frame_id, frame->id());
-
-                // Build 2D-3D correspondences near loop closure frame for PnP verification
-                std::vector<cv::Point3f> lc_obj_pts;
-                std::vector<cv::Point2f> lc_img_pts;
-                {
-                    std::lock_guard<std::mutex> lock(map_.mutex());
-                    const auto& mps = map_.map_points();
-
-                    cv::Mat mp_descs;
-                    std::vector<int> mp_ids_vec;
-                    for (int mi = 0; mi < (int)mps.size(); mi++) {
-                        if (!mps[mi].is_valid() || mps[mi].descriptor().empty()) continue;
-                        const auto& obs = mps[mi].observations();
-                        bool near_lc = false;
-                        for (const auto& ob : obs) {
-                            if (std::abs(ob.first - lr.matched_frame_id) < 30) {
-                                near_lc = true;
-                                break;
-                            }
-                        }
-                        if (!near_lc) continue;
-                        mp_descs.push_back(mps[mi].descriptor());
-                        mp_ids_vec.push_back(mi);
-                    }
-
-                    if (mp_descs.rows >= 20 && !frame->descriptors().empty()) {
-                        auto flann = cv::FlannBasedMatcher::create();
-                        std::vector<std::vector<cv::DMatch>> knn;
-                        flann->knnMatch(frame->descriptors(), mp_descs, knn, 2);
-
-                        for (const auto& m : knn) {
-                            if (m.size() >= 2 && m[0].distance < 0.7f * m[1].distance) {
-                                int mp_id = mp_ids_vec[m[0].trainIdx];
-                                cv::Point3d p = mps[mp_id].position();
-                                lc_obj_pts.emplace_back((float)p.x, (float)p.y, (float)p.z);
-                                lc_img_pts.push_back(frame->keypoints()[m[0].queryIdx].pt);
-                            }
-                        }
-                    }
-                }
-
-                // Verify loop closure via PnP and create PGO constraint
-                if ((int)lc_obj_pts.size() >= 15) {
-                    cv::Mat rvec, tvec, inliers;
-                    bool ok = cv::solvePnPRansac(lc_obj_pts, lc_img_pts, K_, cv::Mat(),
-                                                  rvec, tvec, false,
-                                                  300, (float)Config::PNP_RANSAC_THRESHOLD,
-                                                  0.99, inliers);
-                    if (ok && inliers.rows >= 15) {
-                        cv::Mat R_cam;
-                        cv::Rodrigues(rvec, R_cam);
-                        cv::Mat R_lc = R_cam.t();
-                        cv::Mat t_lc = -R_cam.t() * tvec;
-
-                        double jump = cv::norm(t_lc - t_world_);
-                        if (jump < 0.5 && jump > 0.01) {
-                            auto matched_frame = map_.get_frame(lr.matched_frame_id);
-                            if (matched_frame) {
-                                cv::Mat R_from = matched_frame->get_rotation();
-                                cv::Mat t_from = matched_frame->get_translation();
-
-                                LoopConstraint lc_constraint;
-                                lc_constraint.from_id = lr.matched_frame_id;
-                                lc_constraint.to_id = frame->id();
-                                lc_constraint.R_rel = R_from.t() * R_lc;
-                                lc_constraint.t_rel = R_from.t() * (t_lc - t_from);
-                                lc_constraint.trans_sigma = Config::PGO_LC_TRANS_SIGMA;
-                                lc_constraint.rot_sigma = Config::PGO_LC_ROT_SIGMA;
-                                loop_constraints_.push_back(lc_constraint);
-                            }
-                        }
-                    }
-                }
-            }
+            handle_loop_closure(frame);
         }
 
         // --- Map point visibility tracking (ORB-SLAM3-style) ---
@@ -1493,35 +1489,22 @@ void Slam::run_pnp(std::shared_ptr<Frame> frame) {
         }
     }
 
-    if ((int)obj_pts.size() < Config::PNP_MIN_POINTS) return;
-
-    cv::Mat rvec, tvec;
-    cv::Mat inliers;
-    bool ok = cv::solvePnPRansac(obj_pts, img_pts, K_, cv::Mat(),
-                                  rvec, tvec, false,
-                                  100, (float)Config::PNP_RANSAC_THRESHOLD,
-                                  0.99, inliers);
-    if (!ok || inliers.rows < Config::PNP_MIN_POINTS) return;
-
-    cv::Mat R_cam;
-    cv::Rodrigues(rvec, R_cam);
-
-    cv::Mat R_new = R_cam.t();
-    cv::Mat t_new = -R_cam.t() * tvec;
+    auto pnp = solve_pnp(obj_pts, img_pts, 100, Config::PNP_MIN_POINTS);
+    if (!pnp.success) return;
 
     cv::Mat t_cur = frame->get_translation();
-    double jump_dist = cv::norm(t_new - t_cur);
+    double jump_dist = cv::norm(pnp.t_world - t_cur);
     if (jump_dist > 1.5) return;
 
     // Blend PnP result with current pose (50/50)
     double blend = 0.5;
 
-    cv::Mat t_blended = (1.0 - blend) * t_cur + blend * t_new;
+    cv::Mat t_blended = (1.0 - blend) * t_cur + blend * pnp.t_world;
 
     cv::Mat R_cur = frame->get_rotation();
     cv::Mat rvec_cur, rvec_new_r;
     cv::Rodrigues(R_cur, rvec_cur);
-    cv::Rodrigues(R_new, rvec_new_r);
+    cv::Rodrigues(pnp.R_world, rvec_new_r);
     cv::Mat rvec_blended = (1.0 - blend) * rvec_cur + blend * rvec_new_r;
     cv::Mat R_blended;
     cv::Rodrigues(rvec_blended, R_blended);

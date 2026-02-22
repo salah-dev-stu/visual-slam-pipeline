@@ -95,20 +95,37 @@ private:
 
     int track_local_map(std::shared_ptr<Frame> frame);
 
-    // Invalidates map points with large reprojection errors for a given frame
+    /// Invalidates map points with large reprojection errors for a given frame.
     void cull_map_points(std::shared_ptr<Frame> frame);
 
-    // Attempts PnP-based recovery when feature matching fails.
-    // Returns: 1 = recovered, 0 = not needed, -1 = failed
+    /// Attempts PnP-based recovery when feature matching fails.
+    /// Returns: 1 = recovered, 0 = not needed, -1 = failed
     int try_pnp_recovery(std::shared_ptr<Frame> frame);
 
-    // Handles stationary frame detection and processing.
-    // Returns true if frame was stationary (caller should return true from process_frame)
+    /// Handles stationary frame detection and processing.
+    /// Returns true if frame was stationary (caller should return true from process_frame)
     bool process_stationary_frame(std::shared_ptr<Frame> frame,
                                    const std::vector<cv::DMatch>& good_matches);
 
-    // Common keyframe initialization: triangulation, depth points, optional BA, culling
+    /// Common keyframe initialization: triangulation, depth points, optional BA, culling
     void setup_new_keyframe(std::shared_ptr<Frame> frame);
+
+    /// Handles loop closure detection, PnP verification, and PGO constraint creation.
+    void handle_loop_closure(std::shared_ptr<Frame> frame);
+
+    /// Result of a PnP solve: world-frame rotation and translation, inlier count.
+    struct PnPResult {
+        bool success;
+        cv::Mat R_world;  // 3x3 rotation (world frame)
+        cv::Mat t_world;  // 3x1 translation (world frame)
+        int inlier_count;
+    };
+
+    /// Unified PnP solver: runs solvePnPRansac and converts the result to world-frame
+    /// pose (R_world, t_world). Avoids duplicating Rodrigues + camera-to-world conversion.
+    PnPResult solve_pnp(const std::vector<cv::Point3f>& obj_pts,
+                        const std::vector<cv::Point2f>& img_pts,
+                        int ransac_iters = 100, int min_inliers = 10);
 
     bool estimate_motion_3d3d(const std::vector<cv::Point2f>& pts1,
                                const std::vector<cv::Point2f>& pts2,
