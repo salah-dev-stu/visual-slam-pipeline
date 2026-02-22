@@ -48,7 +48,7 @@ void Frame::load_depth_image(const std::string& depth_path) {
     cv::Mat depth_raw = cv::imread(depth_path, cv::IMREAD_UNCHANGED);
     if (depth_raw.empty()) return;
 
-    depth_raw.convertTo(depth_map_, CV_32F, 1.0 / 5000.0);
+    depth_raw.convertTo(depth_map_, CV_32F, 1.0 / Config::DEPTH_SCALE_FACTOR);
     depth_map_.setTo(0, depth_raw == 0);
     has_real_depth_ = true;
 }

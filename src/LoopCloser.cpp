@@ -52,7 +52,7 @@ LoopResult LoopCloser::detect(const std::shared_ptr<Frame>& current_frame,
                           knn_matches, 2);
 
         std::vector<cv::DMatch> good_matches;
-        float ratio_thresh = is_float ? Config::L2_RATIO_THRESHOLD : 0.8f;
+        float ratio_thresh = is_float ? Config::L2_RATIO_THRESHOLD : Config::HAMMING_RATIO_THRESHOLD;
         for (const auto& m : knn_matches) {
             if (m.size() >= 2 && m[0].distance < ratio_thresh * m[1].distance) {
                 good_matches.push_back(m[0]);

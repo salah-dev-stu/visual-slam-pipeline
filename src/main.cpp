@@ -1080,10 +1080,10 @@ void slam_processing_thread(const std::vector<ImageInfo>& images,
 
     std::vector<cv::Point3d> dense_cloud;
     dense_cloud.reserve(500000);
-    constexpr int DENSE_PIXEL_STEP = 8;     // subsample pixels
-    constexpr double DENSE_MAX_DEPTH = 5.0; // meters
-    constexpr double DENSE_VOXEL = 0.02;    // 2cm voxel grid for dedup
-    constexpr double DENSE_VOXEL_INV = 1.0 / DENSE_VOXEL;
+    const int DENSE_PIXEL_STEP = Config::DENSE_PIXEL_STEP;
+    const double DENSE_MAX_DEPTH = Config::DENSE_MAX_DEPTH;
+    const double DENSE_VOXEL = Config::DENSE_VOXEL_SIZE;
+    const double DENSE_VOXEL_INV = 1.0 / DENSE_VOXEL;
     auto voxel_hash = [](const std::tuple<int,int,int>& v) {
         size_t h = 0;
         h ^= std::hash<int>()(std::get<0>(v)) + 0x9e3779b9 + (h << 6) + (h >> 2);

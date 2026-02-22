@@ -106,8 +106,8 @@ double Slam::estimate_scale_from_depth(const std::vector<cv::Point2f>& pts1,
         float d1 = depth1.at<float>(py1, px1);
         float d2 = depth2.at<float>(py2, px2);
 
-        if (d1 <= 0.1f || d1 > 10.0f) continue;
-        if (d2 <= 0.1f || d2 > 10.0f) continue;
+        if (d1 <= Config::DEPTH_MIN || d1 > Config::DEPTH_MAX) continue;
+        if (d2 <= Config::DEPTH_MIN || d2 > Config::DEPTH_MAX) continue;
 
         cv::Mat P1 = (cv::Mat_<double>(3, 1) <<
             (pts1[i].x - cx) * d1 / fx,
@@ -175,7 +175,7 @@ double Slam::estimate_scale_single_depth(const std::vector<cv::Point2f>& pts1,
         if (px1 < 0 || px1 >= depth1.cols || py1 < 0 || py1 >= depth1.rows) continue;
 
         float d1 = depth1.at<float>(py1, px1);
-        if (d1 <= 0.1f || d1 > 10.0f) continue;
+        if (d1 <= Config::DEPTH_MIN || d1 > Config::DEPTH_MAX) continue;
 
         double X1 = (pts1[i].x - cx) * d1 / fx;
         double Y1 = (pts1[i].y - cy) * d1 / fy;
@@ -245,8 +245,8 @@ bool Slam::estimate_motion_3d3d(const std::vector<cv::Point2f>& pts1,
         float d1 = depth1.at<float>(py1, px1);
         float d2 = depth2.at<float>(py2, px2);
 
-        if (d1 <= 0.1f || d1 > 10.0f) continue;
-        if (d2 <= 0.1f || d2 > 10.0f) continue;
+        if (d1 <= Config::DEPTH_MIN || d1 > Config::DEPTH_MAX) continue;
+        if (d2 <= Config::DEPTH_MIN || d2 > Config::DEPTH_MAX) continue;
 
         cv::Mat P1 = (cv::Mat_<double>(3, 1) <<
             (pts1[i].x - cx) * d1 / fx,
@@ -267,8 +267,8 @@ bool Slam::estimate_motion_3d3d(const std::vector<cv::Point2f>& pts1,
     }
 
     // RANSAC with SVD-based rigid transform (3-point minimal solver)
-    const int MAX_ITER = 200;
-    const double INLIER_THRESH = 0.05;  // 5cm
+    const int MAX_ITER = Config::RANSAC_3D3D_ITERATIONS;
+    const double INLIER_THRESH = Config::RANSAC_3D3D_INLIER_THRESH;
 
     int best_inliers = 0;
     cv::Mat best_R, best_t;
@@ -359,7 +359,7 @@ bool Slam::estimate_motion_3d3d(const std::vector<cv::Point2f>& pts1,
 
     // Sanity checks: reject excessive or negligible translation
     double t_norm = cv::norm(t_out);
-    if (t_norm > 0.2) {
+    if (t_norm > Config::RANSAC_3D3D_MAX_TRANSLATION) {
         return false;
     }
     if (t_norm < 0.0001) {
@@ -386,8 +386,8 @@ int Slam::track_local_map(std::shared_ptr<Frame> frame) {
     int nkp = (int)kps.size();
     std::vector<double> best_desc_dist(nkp, 1e9);
 
-    // Build grid index for keypoints (30px cells) for efficient spatial search
-    const int CELL_SIZE = 30;
+    // Build grid index for keypoints for efficient spatial search
+    const int CELL_SIZE = Config::TRACK_GRID_CELL_SIZE;
     const int GRID_W = (Config::IMAGE_WIDTH + CELL_SIZE - 1) / CELL_SIZE;
     const int GRID_H = (Config::IMAGE_HEIGHT + CELL_SIZE - 1) / CELL_SIZE;
     std::vector<std::vector<int>> grid(GRID_W * GRID_H);
@@ -405,9 +405,9 @@ int Slam::track_local_map(std::shared_ptr<Frame> frame) {
     cv::Mat R_cam = R.t();
     cv::Mat t_cam = -R_cam * t;
 
-    const double SEARCH_RADIUS = 12.0;
+    const double SEARCH_RADIUS = Config::TRACK_SEARCH_RADIUS;
     const double SEARCH_RADIUS_SQ = SEARCH_RADIUS * SEARCH_RADIUS;
-    const double DESC_THRESHOLD = 0.5;
+    const double DESC_THRESHOLD = Config::TRACK_DESC_THRESHOLD;
     int tracked = 0;
 
     std::lock_guard<std::mutex> lock(map_.mutex());
@@ -423,7 +423,7 @@ int Slam::track_local_map(std::shared_ptr<Frame> frame) {
         double py = R_cam.at<double>(1,0)*pos.x + R_cam.at<double>(1,1)*pos.y + R_cam.at<double>(1,2)*pos.z + t_cam.at<double>(1);
         double pz = R_cam.at<double>(2,0)*pos.x + R_cam.at<double>(2,1)*pos.y + R_cam.at<double>(2,2)*pos.z + t_cam.at<double>(2);
 
-        if (pz < 0.1 || pz > 15.0) continue;
+        if (pz < Config::DEPTH_MIN || pz > Config::TRIANG_MAX_DEPTH) continue;
 
         double u = Config::FX * px / pz + Config::CX;
         double v = Config::FY * py / pz + Config::CY;
@@ -487,7 +487,7 @@ void Slam::cull_map_points(std::shared_ptr<Frame> frame) {
             cv::Mat Pw = (cv::Mat_<double>(3,1) << pw.x, pw.y, pw.z);
             cv::Mat pc = R_cam * Pw + t_cam;
             double z = pc.at<double>(2);
-            if (z < 0.1) { mps[mp_id].set_valid(false); continue; }
+            if (z < Config::DEPTH_MIN) { mps[mp_id].set_valid(false); continue; }
             double u = fx * pc.at<double>(0) / z + cx;
             double v = fy * pc.at<double>(1) / z + cy;
             double dx = u - frame->keypoints()[i].pt.x;
@@ -567,7 +567,7 @@ int Slam::try_pnp_recovery(std::shared_ptr<Frame> frame) {
         flann->knnMatch(frame->descriptors(), all_mp_descs, knn, 2);
 
         for (const auto& m : knn) {
-            if (m.size() >= 2 && m[0].distance < 0.7f * m[1].distance) {
+            if (m.size() >= 2 && m[0].distance < Config::FLANN_RATIO_THRESHOLD * m[1].distance) {
                 obj_pts.push_back(all_obj_pts[m[0].trainIdx]);
                 img_pts.push_back(frame->keypoints()[m[0].queryIdx].pt);
             }
@@ -579,9 +579,9 @@ int Slam::try_pnp_recovery(std::shared_ptr<Frame> frame) {
             if (pnp.success) {
                 double jump = cv::norm(pnp.t_world - t_world_);
 
-                if (jump < 1.5) {
+                if (jump < Config::PNP_RECOVERY_MAX_JUMP) {
                     // Blend recovered pose with current estimate
-                    double blend = (jump < 0.1) ? 0.8 : 0.3;
+                    double blend = (jump < 0.1) ? Config::PNP_RECOVERY_BLEND_CLOSE : Config::PNP_RECOVERY_BLEND_FAR;
                     R_world_ = pnp.R_world.clone();
                     t_world_ = (1.0 - blend) * t_world_ + blend * pnp.t_world;
                     frame->set_pose(R_world_, t_world_);
@@ -712,7 +712,7 @@ void Slam::setup_new_keyframe(std::shared_ptr<Frame> frame) {
         if (ba_err_after < ba_err_before && ba_err_after > 0) {
             cv::Mat t_after = frame->get_translation();
             double ba_jump = cv::norm(t_after - t_before);
-            if (ba_jump < 0.5) {
+            if (ba_jump < Config::BA_MAX_JUMP) {
                 R_world_ = frame->get_rotation().clone();
                 t_world_ = frame->get_translation().clone();
             } else {
@@ -748,7 +748,7 @@ void Slam::handle_loop_closure(std::shared_ptr<Frame> frame) {
             const auto& obs = mps[mi].observations();
             bool near_lc = false;
             for (const auto& ob : obs) {
-                if (std::abs(ob.first - lr.matched_frame_id) < 30) {
+                if (std::abs(ob.first - lr.matched_frame_id) < Config::LC_NEARBY_FRAME_RANGE) {
                     near_lc = true;
                     break;
                 }
@@ -764,7 +764,7 @@ void Slam::handle_loop_closure(std::shared_ptr<Frame> frame) {
             flann->knnMatch(frame->descriptors(), mp_descs, knn, 2);
 
             for (const auto& m : knn) {
-                if (m.size() >= 2 && m[0].distance < 0.7f * m[1].distance) {
+                if (m.size() >= 2 && m[0].distance < Config::FLANN_RATIO_THRESHOLD * m[1].distance) {
                     int mp_id = mp_ids_vec[m[0].trainIdx];
                     cv::Point3d p = mps[mp_id].position();
                     lc_obj_pts.emplace_back((float)p.x, (float)p.y, (float)p.z);
@@ -779,7 +779,7 @@ void Slam::handle_loop_closure(std::shared_ptr<Frame> frame) {
     if (!pnp.success) return;
 
     double jump = cv::norm(pnp.t_world - t_world_);
-    if (jump >= 0.5 || jump <= 0.01) return;
+    if (jump >= Config::LC_MAX_JUMP || jump <= Config::LC_MIN_JUMP) return;
 
     auto matched_frame = map_.get_frame(lr.matched_frame_id);
     if (!matched_frame) return;
@@ -1098,7 +1098,7 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
                     for (int ki = 0; ki < (int)frame->keypoints().size(); ki++) {
                         double dx = proj.x - frame->keypoints()[ki].pt.x;
                         double dy = proj.y - frame->keypoints()[ki].pt.y;
-                        if (dx*dx + dy*dy < 8.0 * 8.0) {
+                        if (dx*dx + dy*dy < Config::TRACK_VISIBILITY_RADIUS * Config::TRACK_VISIBILITY_RADIUS) {
                             mp.increase_found();
                             break;
                         }
@@ -1115,11 +1115,11 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
                 if (!mp.is_valid()) continue;
                 int age = keyframe_count_ - mp.first_kf_id();
                 if (age >= 3 && mp.visible_count() > 0) {
-                    if (mp.get_found_ratio() < 0.15f) {
+                    if (mp.get_found_ratio() < Config::CULL_FOUND_RATIO_YOUNG) {
                         mp.set_valid(false);
                     }
                 }
-                if (age >= 5 && mp.observation_count() <= 2 && mp.get_found_ratio() < 0.3f) {
+                if (age >= 5 && mp.observation_count() <= 2 && mp.get_found_ratio() < Config::CULL_FOUND_RATIO_OLD) {
                     mp.set_valid(false);
                 }
             }
@@ -1297,7 +1297,7 @@ void Slam::triangulate_points(std::shared_ptr<Frame> frame1,
             if (px >= 0 && px < frame2->depth_map().cols &&
                 py >= 0 && py < frame2->depth_map().rows) {
                 float z_real = frame2->depth_map().at<float>(py, px);
-                if (z_real > 0.1f && z_real < 10.0f) {
+                if (z_real > Config::DEPTH_MIN && z_real < Config::DEPTH_MAX) {
                     double x_cam = (pts2[i].x - Config::CX) * z_real / Config::FX;
                     double y_cam = (pts2[i].y - Config::CY) * z_real / Config::FY;
                     cv::Mat p_cam = (cv::Mat_<double>(3, 1) << x_cam, y_cam, (double)z_real);
@@ -1424,7 +1424,7 @@ void Slam::refine_pose_via_local_pnp(std::shared_ptr<Frame> frame, int tracked) 
         auto pnp = solve_pnp(obj_pts, img_pts, 100, 10);
         if (pnp.success) {
             double jump = cv::norm(pnp.t_world - t_world_);
-            if (jump < 1.0) {
+            if (jump < Config::PNP_REFINE_MAX_JUMP) {
                 double inlier_ratio = (double)pnp.inlier_count / (double)obj_pts.size();
 
                 // Adaptive blend: higher inlier ratio → trust PnP more
@@ -1498,10 +1498,10 @@ void Slam::run_pnp(std::shared_ptr<Frame> frame) {
 
     cv::Mat t_cur = frame->get_translation();
     double jump_dist = cv::norm(pnp.t_world - t_cur);
-    if (jump_dist > 1.5) return;
+    if (jump_dist > Config::PNP_PERIODIC_MAX_JUMP) return;
 
-    // Blend PnP result with current pose (50/50)
-    double blend = 0.5;
+    // Blend PnP result with current pose
+    double blend = Config::PNP_PERIODIC_BLEND;
 
     cv::Mat t_blended = (1.0 - blend) * t_cur + blend * pnp.t_world;
 
@@ -1548,7 +1548,7 @@ void Slam::create_points_from_depth(std::shared_ptr<Frame> frame) {
         if (px < 0 || px >= depth.cols || py < 0 || py >= depth.rows) continue;
 
         float z = depth.at<float>(py, px);
-        if (z <= 0.1f || z > Config::TRIANG_MAX_CAM_DIST) continue;
+        if (z <= Config::DEPTH_MIN || z > Config::TRIANG_MAX_CAM_DIST) continue;
 
         // Back-project pixel to 3D camera coordinates, then transform to world
         double x_cam = (u - Config::CX) * z / Config::FX;
