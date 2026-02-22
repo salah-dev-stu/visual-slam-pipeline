@@ -4,11 +4,14 @@
 #include <opencv2/imgproc.hpp>
 #include <iostream>
 
+/// Constructs an uninitialized depth estimator.
 DepthEstimator::DepthEstimator()
     : available_(false) {}
 
+/// Destructor: releases the ONNX Runtime session.
 DepthEstimator::~DepthEstimator() = default;
 
+/// Loads the MiDaS ONNX model with optional CUDA acceleration.
 bool DepthEstimator::init(const std::string& model_path) {
     try {
         env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "MiDaS");
@@ -32,6 +35,7 @@ bool DepthEstimator::init(const std::string& model_path) {
     }
 }
 
+/// Runs MiDaS inference to produce a normalized inverse-depth map from an RGB image.
 cv::Mat DepthEstimator::estimate(const cv::Mat& image) {
     if (!available_) return cv::Mat();
 
