@@ -98,6 +98,9 @@ private:
     /// Invalidates map points with large reprojection errors for a given frame.
     void cull_map_points(std::shared_ptr<Frame> frame);
 
+    /// Refines the current pose using PnP on locally tracked map points.
+    void refine_pose_via_local_pnp(std::shared_ptr<Frame> frame, int tracked);
+
     /// Attempts PnP-based recovery when feature matching fails.
     /// Returns: 1 = recovered, 0 = not needed, -1 = failed
     int try_pnp_recovery(std::shared_ptr<Frame> frame);

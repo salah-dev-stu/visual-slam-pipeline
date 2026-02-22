@@ -9,6 +9,7 @@ static const float kViewpointY = -0.7f;
 static const float kViewpointZ = -1.8f;
 static const float kViewpointF = 500.0f;
 
+/// Constructs the viewer with default camera parameters and view mode.
 Viewer::Viewer() : initialized_(false), should_quit_(false), should_restart_(false),
                    s_cam_(nullptr), d_cam_(nullptr),
                    has_new_image_(false),
@@ -20,10 +21,12 @@ Viewer::Viewer() : initialized_(false), should_quit_(false), should_restart_(fal
                    focus_x_(0), focus_y_(0), focus_z_(0) {
 }
 
+/// Destroys the viewer, releasing Pangolin resources.
 Viewer::~Viewer() {
     shutdown();
 }
 
+/// Sets the initial camera focus point in world coordinates.
 void Viewer::set_initial_viewpoint(double x, double y, double z) {
     has_initial_focus_ = true;
     focus_x_ = x * Config::TRAJECTORY_SCALE;
@@ -31,6 +34,7 @@ void Viewer::set_initial_viewpoint(double x, double y, double z) {
     focus_z_ = z * Config::TRAJECTORY_SCALE;
 }
 
+/// Initializes the Pangolin window, OpenGL state, UI panel, and 3D display.
 void Viewer::init() {
     if (initialized_) return;
 
@@ -68,6 +72,7 @@ void Viewer::init() {
     initialized_ = true;
 }
 
+/// Renders one frame: handles UI buttons, draws trajectory/cameras/points.
 bool Viewer::render_frame() {
     if (!initialized_ || should_quit_) return false;
 
@@ -124,6 +129,7 @@ bool Viewer::render_frame() {
     return true;
 }
 
+/// Destroys the Pangolin window and frees OpenGL resources.
 void Viewer::shutdown() {
     if (initialized_) {
         pangolin::DestroyWindow("SLAM System");
@@ -134,11 +140,13 @@ void Viewer::shutdown() {
     }
 }
 
+/// Thread-safe update of the estimated trajectory for rendering.
 void Viewer::update_trajectory(const std::vector<cv::Point3d>& trajectory) {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
     trajectory_ = trajectory;
 }
 
+/// Thread-safe update of keyframe 4x4 poses for frustum rendering.
 void Viewer::update_poses(const std::vector<cv::Mat>& poses) {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
     poses_.clear();
@@ -148,6 +156,7 @@ void Viewer::update_poses(const std::vector<cv::Mat>& poses) {
     }
 }
 
+/// Thread-safe update of the current video frame for the OpenCV window.
 void Viewer::update_image(const cv::Mat& image) {
     std::lock_guard<std::mutex> lock(image_mutex_);
     if (!image.empty()) {
@@ -156,26 +165,31 @@ void Viewer::update_image(const cv::Mat& image) {
     }
 }
 
+/// Thread-safe update of the dense point cloud for 3D rendering.
 void Viewer::update_map_points(const std::vector<cv::Point3d>& points) {
     std::lock_guard<std::mutex> lock(points_mutex_);
     map_points_ = points;
 }
 
+/// Thread-safe update of the sparse (triangulated) point cloud.
 void Viewer::update_sparse_points(const std::vector<cv::Point3d>& points) {
     std::lock_guard<std::mutex> lock(points_mutex_);
     sparse_points_ = points;
 }
 
+/// Thread-safe update of loop closure edges for visualization.
 void Viewer::update_loop_edges(const std::vector<std::pair<cv::Point3d, cv::Point3d>>& edges) {
     std::lock_guard<std::mutex> lock(loop_mutex_);
     loop_edges_ = edges;
 }
 
+/// Thread-safe update of the ground truth trajectory for overlay.
 void Viewer::update_ground_truth(const std::vector<cv::Point3d>& gt) {
     std::lock_guard<std::mutex> lock(gt_mutex_);
     ground_truth_ = gt;
 }
 
+/// Displays the current video frame in an OpenCV window.
 void Viewer::show_image() {
     std::lock_guard<std::mutex> lock(image_mutex_);
     if (has_new_image_ && !current_image_.empty()) {
@@ -185,6 +199,7 @@ void Viewer::show_image() {
     }
 }
 
+/// Draws the estimated trajectory as a white line strip with colored endpoints.
 void Viewer::draw_trajectory() {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
 
@@ -216,6 +231,7 @@ void Viewer::draw_trajectory() {
     glEnd();
 }
 
+/// Draws keyframe frustums and the current camera with smooth interpolation.
 void Viewer::draw_camera_poses() {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
 
@@ -237,6 +253,7 @@ void Viewer::draw_camera_poses() {
     draw_camera_frustum(interpolated_pose_, camera_size_, true);
 }
 
+/// Draws a single camera frustum wireframe at the given 4x4 pose.
 void Viewer::draw_camera_frustum(const cv::Mat& pose, float size, bool current) {
     if (pose.empty() || pose.rows != 4 || pose.cols != 4) return;
 
@@ -290,6 +307,7 @@ void Viewer::draw_camera_frustum(const cv::Mat& pose, float size, bool current) 
     glPopMatrix();
 }
 
+/// Draws the dense point cloud with height-based color gradient.
 void Viewer::draw_map_points() {
     std::lock_guard<std::mutex> lock(points_mutex_);
 
@@ -329,6 +347,7 @@ void Viewer::draw_map_points() {
     glEnd();
 }
 
+/// Draws the sparse triangulated map points in cyan.
 void Viewer::draw_sparse_points() {
     std::lock_guard<std::mutex> lock(points_mutex_);
     if (sparse_points_.empty()) return;
@@ -344,6 +363,7 @@ void Viewer::draw_sparse_points() {
     glEnd();
 }
 
+/// Draws loop closure edges as red lines between matched frames.
 void Viewer::draw_loop_edges() {
     std::lock_guard<std::mutex> lock(loop_mutex_);
 
@@ -361,6 +381,7 @@ void Viewer::draw_loop_edges() {
     glEnd();
 }
 
+/// Draws the ground truth trajectory as a green line strip.
 void Viewer::draw_ground_truth() {
     std::lock_guard<std::mutex> lock(gt_mutex_);
 
@@ -377,6 +398,7 @@ void Viewer::draw_ground_truth() {
     glEnd();
 }
 
+/// Updates the virtual camera to follow the latest pose based on view mode.
 void Viewer::follow_current_pose() {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
 

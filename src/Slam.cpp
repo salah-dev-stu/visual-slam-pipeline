@@ -822,8 +822,6 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
         return false;
     }
 
-    frame->compute_global_descriptor();
-
     // --- First frame initialization ---
     if (!last_frame_) {
         frame->set_pose(R_world_, t_world_);
@@ -1056,108 +1054,9 @@ bool Slam::process_frame(std::shared_ptr<Frame> frame) {
     frame->set_pose(R_world_, t_world_);
     map_.add_frame(frame);
 
-    // --- Local map tracking ---
+    // --- Local map tracking + PnP refinement ---
     int tracked = track_local_map(frame);
-
-    // Compute reprojection error before PnP refinement
-    {
-        double fx = K_.at<double>(0,0), fy = K_.at<double>(1,1);
-        double cx = K_.at<double>(0,2), cy = K_.at<double>(1,2);
-        cv::Mat Rc = R_world_.t();
-        cv::Mat tc = -Rc * t_world_;
-        double sum = 0;
-        int cnt = 0;
-        std::lock_guard<std::mutex> lock(map_.mutex());
-        const auto& mps = map_.map_points();
-        const auto& indices = frame->map_point_indices();
-        for (int i = 0; i < (int)indices.size(); i++) {
-            int mp_id = indices[i];
-            if (mp_id < 0 || mp_id >= (int)mps.size() || !mps[mp_id].is_valid()) continue;
-            cv::Point3d pw = mps[mp_id].position();
-            cv::Mat p = (cv::Mat_<double>(3,1) << pw.x, pw.y, pw.z);
-            cv::Mat pc = Rc * p + tc;
-            double z = pc.at<double>(2);
-            if (z < 0.01) continue;
-            double u = fx * pc.at<double>(0) / z + cx;
-            double v = fy * pc.at<double>(1) / z + cy;
-            double dx = u - frame->keypoints()[i].pt.x;
-            double dy = v - frame->keypoints()[i].pt.y;
-            sum += std::sqrt(dx*dx + dy*dy);
-            cnt++;
-        }
-        reproj_error_before_ = cnt > 0 ? sum / cnt : 0.0;
-        reproj_error_after_ = reproj_error_before_;
-    }
-
-    // --- PnP refinement using tracked map points ---
-    if (tracked >= 10) {
-        std::vector<cv::Point3f> obj_pts;
-        std::vector<cv::Point2f> img_pts;
-        {
-            std::lock_guard<std::mutex> lock(map_.mutex());
-            const auto& mps = map_.map_points();
-            const auto& indices = frame->map_point_indices();
-            for (int i = 0; i < (int)indices.size(); i++) {
-                int mp_id = indices[i];
-                if (mp_id >= 0 && mp_id < (int)mps.size() && mps[mp_id].is_valid()) {
-                    cv::Point3d p = mps[mp_id].position();
-                    obj_pts.emplace_back((float)p.x, (float)p.y, (float)p.z);
-                    img_pts.push_back(frame->keypoints()[i].pt);
-                }
-            }
-        }
-
-        cv::Mat R_prev_pose = R_world_.clone();
-        cv::Mat t_prev_pose = t_world_.clone();
-        auto pnp = solve_pnp(obj_pts, img_pts, 100, 10);
-        if (pnp.success) {
-            double jump = cv::norm(pnp.t_world - t_world_);
-            if (jump < 1.0) {
-                double inlier_ratio = (double)pnp.inlier_count / (double)obj_pts.size();
-
-                // Adaptive blend: higher inlier ratio → trust PnP more
-                double blend = std::min(0.5, 0.3 + 0.2 * std::max(0.0, std::min(1.0, (inlier_ratio - 0.5) / 0.5)));
-
-                cv::Mat t_blended = (1.0 - blend) * t_world_ + blend * pnp.t_world;
-
-                cv::Mat rvec_cur, rvec_pnp_r;
-                cv::Rodrigues(R_world_, rvec_cur);
-                cv::Rodrigues(pnp.R_world, rvec_pnp_r);
-                cv::Mat rvec_blended = (1.0 - blend) * rvec_cur + blend * rvec_pnp_r;
-                cv::Mat R_blended;
-                cv::Rodrigues(rvec_blended, R_blended);
-
-                R_world_ = R_blended;
-                t_world_ = t_blended;
-                frame->set_pose(R_world_, t_world_);
-
-                // Compute reprojection error improvement
-                double fx = K_.at<double>(0,0), fy = K_.at<double>(1,1);
-                double cx = K_.at<double>(0,2), cy = K_.at<double>(1,2);
-                auto compute_reproj = [&](const cv::Mat& R_w, const cv::Mat& t_w) {
-                    cv::Mat Rc = R_w.t();
-                    cv::Mat tc = -Rc * t_w;
-                    double sum = 0;
-                    int cnt = 0;
-                    for (int pi = 0; pi < (int)obj_pts.size(); pi++) {
-                        cv::Mat pw = (cv::Mat_<double>(3,1) << obj_pts[pi].x, obj_pts[pi].y, obj_pts[pi].z);
-                        cv::Mat pc = Rc * pw + tc;
-                        double z = pc.at<double>(2);
-                        if (z < 0.01) continue;
-                        double u = fx * pc.at<double>(0) / z + cx;
-                        double v = fy * pc.at<double>(1) / z + cy;
-                        double dx = u - img_pts[pi].x;
-                        double dy = v - img_pts[pi].y;
-                        sum += std::sqrt(dx*dx + dy*dy);
-                        cnt++;
-                    }
-                    return cnt > 0 ? sum / cnt : 0.0;
-                };
-                reproj_error_before_ = compute_reproj(R_prev_pose, t_prev_pose);
-                reproj_error_after_ = compute_reproj(R_world_, t_world_);
-            }
-        }
-    }
+    refine_pose_via_local_pnp(frame, tracked);
 
     // --- Proactive keyframe: force when match count is getting low ---
     if (!frame->is_keyframe() && last_match_count_ < Config::MIN_MATCHES * 2) {
@@ -1466,6 +1365,111 @@ bool Slam::is_keyframe(std::shared_ptr<Frame> frame, int match_count) {
     if (match_count < Config::KF_MIN_MATCHES) return false;
 
     return true;
+}
+
+/// Computes reprojection error before and after PnP-based pose refinement
+/// using locally tracked map points. Blends PnP result with current pose
+/// using an adaptive weight based on inlier ratio.
+void Slam::refine_pose_via_local_pnp(std::shared_ptr<Frame> frame, int tracked) {
+    // Compute reprojection error before PnP refinement
+    {
+        double fx = K_.at<double>(0,0), fy = K_.at<double>(1,1);
+        double cx = K_.at<double>(0,2), cy = K_.at<double>(1,2);
+        cv::Mat Rc = R_world_.t();
+        cv::Mat tc = -Rc * t_world_;
+        double sum = 0;
+        int cnt = 0;
+        std::lock_guard<std::mutex> lock(map_.mutex());
+        const auto& mps = map_.map_points();
+        const auto& indices = frame->map_point_indices();
+        for (int i = 0; i < (int)indices.size(); i++) {
+            int mp_id = indices[i];
+            if (mp_id < 0 || mp_id >= (int)mps.size() || !mps[mp_id].is_valid()) continue;
+            cv::Point3d pw = mps[mp_id].position();
+            cv::Mat p = (cv::Mat_<double>(3,1) << pw.x, pw.y, pw.z);
+            cv::Mat pc = Rc * p + tc;
+            double z = pc.at<double>(2);
+            if (z < 0.01) continue;
+            double u = fx * pc.at<double>(0) / z + cx;
+            double v = fy * pc.at<double>(1) / z + cy;
+            double dx = u - frame->keypoints()[i].pt.x;
+            double dy = v - frame->keypoints()[i].pt.y;
+            sum += std::sqrt(dx*dx + dy*dy);
+            cnt++;
+        }
+        reproj_error_before_ = cnt > 0 ? sum / cnt : 0.0;
+        reproj_error_after_ = reproj_error_before_;
+    }
+
+    // PnP refinement using tracked map points
+    if (tracked >= 10) {
+        std::vector<cv::Point3f> obj_pts;
+        std::vector<cv::Point2f> img_pts;
+        {
+            std::lock_guard<std::mutex> lock(map_.mutex());
+            const auto& mps = map_.map_points();
+            const auto& indices = frame->map_point_indices();
+            for (int i = 0; i < (int)indices.size(); i++) {
+                int mp_id = indices[i];
+                if (mp_id >= 0 && mp_id < (int)mps.size() && mps[mp_id].is_valid()) {
+                    cv::Point3d p = mps[mp_id].position();
+                    obj_pts.emplace_back((float)p.x, (float)p.y, (float)p.z);
+                    img_pts.push_back(frame->keypoints()[i].pt);
+                }
+            }
+        }
+
+        cv::Mat R_prev_pose = R_world_.clone();
+        cv::Mat t_prev_pose = t_world_.clone();
+        auto pnp = solve_pnp(obj_pts, img_pts, 100, 10);
+        if (pnp.success) {
+            double jump = cv::norm(pnp.t_world - t_world_);
+            if (jump < 1.0) {
+                double inlier_ratio = (double)pnp.inlier_count / (double)obj_pts.size();
+
+                // Adaptive blend: higher inlier ratio → trust PnP more
+                double blend = std::min(0.5, 0.3 + 0.2 * std::max(0.0, std::min(1.0, (inlier_ratio - 0.5) / 0.5)));
+
+                cv::Mat t_blended = (1.0 - blend) * t_world_ + blend * pnp.t_world;
+
+                cv::Mat rvec_cur, rvec_pnp_r;
+                cv::Rodrigues(R_world_, rvec_cur);
+                cv::Rodrigues(pnp.R_world, rvec_pnp_r);
+                cv::Mat rvec_blended = (1.0 - blend) * rvec_cur + blend * rvec_pnp_r;
+                cv::Mat R_blended;
+                cv::Rodrigues(rvec_blended, R_blended);
+
+                R_world_ = R_blended;
+                t_world_ = t_blended;
+                frame->set_pose(R_world_, t_world_);
+
+                // Compute reprojection error improvement
+                double fx = K_.at<double>(0,0), fy = K_.at<double>(1,1);
+                double cx = K_.at<double>(0,2), cy = K_.at<double>(1,2);
+                auto compute_reproj = [&](const cv::Mat& R_w, const cv::Mat& t_w) {
+                    cv::Mat Rc = R_w.t();
+                    cv::Mat tc = -Rc * t_w;
+                    double sum = 0;
+                    int cnt = 0;
+                    for (int pi = 0; pi < (int)obj_pts.size(); pi++) {
+                        cv::Mat pw = (cv::Mat_<double>(3,1) << obj_pts[pi].x, obj_pts[pi].y, obj_pts[pi].z);
+                        cv::Mat pc = Rc * pw + tc;
+                        double z = pc.at<double>(2);
+                        if (z < 0.01) continue;
+                        double u = fx * pc.at<double>(0) / z + cx;
+                        double v = fy * pc.at<double>(1) / z + cy;
+                        double dx = u - img_pts[pi].x;
+                        double dy = v - img_pts[pi].y;
+                        sum += std::sqrt(dx*dx + dy*dy);
+                        cnt++;
+                    }
+                    return cnt > 0 ? sum / cnt : 0.0;
+                };
+                reproj_error_before_ = compute_reproj(R_prev_pose, t_prev_pose);
+                reproj_error_after_ = compute_reproj(R_world_, t_world_);
+            }
+        }
+    }
 }
 
 /// Refines camera pose by blending current estimate with PnP solution from

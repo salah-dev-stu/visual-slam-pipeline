@@ -8,12 +8,14 @@
 #include <regex>
 #include <cmath>
 
+/// Default constructor: initializes identity pose and invalid id.
 Frame::Frame()
     : id_(-1), timestamp_(0.0), processed_(false), is_keyframe_(false), has_real_depth_(false) {
     R_ = cv::Mat::eye(3, 3, CV_64F);
     t_ = cv::Mat::zeros(3, 1, CV_64F);
 }
 
+/// Constructs a frame from an image file, loading the color and grayscale images.
 Frame::Frame(int id, const std::string& image_path, double timestamp)
     : id_(id), image_path_(image_path), timestamp_(timestamp),
       processed_(false), is_keyframe_(false), has_real_depth_(false) {
@@ -27,6 +29,7 @@ Frame::Frame(int id, const std::string& image_path, double timestamp)
     cv::cvtColor(image_, gray_, cv::COLOR_BGR2GRAY);
 }
 
+/// Extracts keypoints and descriptors using the given feature extractor.
 void Frame::detect_features(FeatureExtractor& extractor) {
     if (gray_.empty()) return;
     extractor.extract(image_, keypoints_, descriptors_);
@@ -34,11 +37,13 @@ void Frame::detect_features(FeatureExtractor& extractor) {
     processed_ = true;
 }
 
+/// Estimates monocular depth via MiDaS (skipped if Kinect depth is loaded).
 void Frame::estimate_depth(DepthEstimator& estimator) {
     if (image_.empty() || has_real_depth_) return;  // Skip MiDaS if real depth loaded
     depth_map_ = estimator.estimate(image_);
 }
 
+/// Loads a TUM-format 16-bit depth image and converts to meters (factor 5000).
 void Frame::load_depth_image(const std::string& depth_path) {
     cv::Mat depth_raw = cv::imread(depth_path, cv::IMREAD_UNCHANGED);
     if (depth_raw.empty()) return;
@@ -48,6 +53,7 @@ void Frame::load_depth_image(const std::string& depth_path) {
     has_real_depth_ = true;
 }
 
+/// Computes a normalized mean descriptor over all keypoint descriptors.
 void Frame::compute_global_descriptor() {
     if (descriptors_.empty()) {
         global_descriptor_ = cv::Mat();
@@ -90,6 +96,7 @@ void Frame::compute_global_descriptor() {
     }
 }
 
+/// Returns the 4x4 homogeneous world-to-camera transformation matrix.
 cv::Mat Frame::get_pose() const {
     cv::Mat T = cv::Mat::eye(4, 4, CV_64F);
     R_.copyTo(T(cv::Rect(0, 0, 3, 3)));
@@ -97,11 +104,13 @@ cv::Mat Frame::get_pose() const {
     return T;
 }
 
+/// Sets the camera pose (rotation and translation in world frame).
 void Frame::set_pose(const cv::Mat& R, const cv::Mat& t) {
     R.copyTo(R_);
     t.copyTo(t_);
 }
 
+/// Parses a TUM-format timestamp from a filename (e.g., "1311868164.363181.png").
 double Frame::parse_timestamp(const std::string& filename) {
     std::regex re(R"((\d+\.\d+)\.png)");
     std::smatch match;
@@ -111,6 +120,7 @@ double Frame::parse_timestamp(const std::string& filename) {
     return 0.0;
 }
 
+/// Returns a copy of the image with detected keypoints drawn as green circles.
 cv::Mat Frame::draw_keypoints() const {
     cv::Mat output;
     cv::drawKeypoints(image_, keypoints_, output, cv::Scalar(0, 255, 0),
